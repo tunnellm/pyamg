@@ -14,7 +14,7 @@ from ..util import upcast
 
 
 # satisfy_constraints is a helper function for prolongation smoothing routines
-def satisfy_constraints(U, B, BtBinv):
+def satisfy_constraints(U, B, BtBinv, work=None):
     """U is the prolongator update.  Project out components of U such that U@B = 0.
 
     Parameters
@@ -27,6 +27,8 @@ def satisfy_constraints(U, B, BtBinv):
     BtBinv : array
         Local inv(B_i.H@B_i) matrices for each supernode, i
         B_i is B restricted to the sparsity pattern of supernode i in U
+    work : list or None
+        If provided, a 2-element list [numerical_work, graph_work] to accumulate counts.
 
     Returns
     -------
@@ -43,23 +45,31 @@ def satisfy_constraints(U, B, BtBinv):
     rows_per_block = U.blocksize[0]
     cols_per_block = U.blocksize[1]
     num_block_rows = int(U.shape[0]/rows_per_block)
+    k = B.shape[1]
 
     UB = np.ravel(U@B)
 
     # Apply constraints, noting that we need the conjugate of B
     # for use as Bi.H in local projection
     amg_core.satisfy_constraints_helper(rows_per_block, cols_per_block,
-                                        num_block_rows, B.shape[1],
+                                        num_block_rows, k,
                                         np.conjugate(np.ravel(B)),
                                         UB, np.ravel(BtBinv),
                                         U.indptr, U.indices,
                                         np.ravel(U.data))
 
+    if work is not None:
+        # U@B: SpMM with k columns
+        work[0] += U.nnz * k
+        # satisfy_constraints_helper: k^2 ops per block row for BtBinv application
+        work[0] += num_block_rows * k * k
+
     return U
 
 
 def jacobi_prolongation_smoother(S, T, C, B, omega=4.0/3.0, degree=1,
-                                 filter_entries=False, weighting='diagonal'):
+                                 filter_entries=False, weighting='diagonal',
+                                 work=None):
     """Jacobi prolongation smoother.
 
     Parameters
@@ -154,11 +164,16 @@ def jacobi_prolongation_smoother(S, T, C, B, omega=4.0/3.0, degree=1,
         S = S.multiply(C)
         S.eliminate_zeros()
 
+    n = S.shape[0]
     if weighting == 'diagonal':
         # Use diagonal of S
         D_inv = get_diagonal(S, inv=True)
         D_inv_S = scale_rows(S, D_inv, copy=True)
-        D_inv_S = (omega/approximate_spectral_radius(D_inv_S))*D_inv_S
+        rho = approximate_spectral_radius(D_inv_S, work=work)
+        D_inv_S = (omega/rho)*D_inv_S
+        if work is not None:
+            work[0] += n + 2 * S.nnz  # n inversions + nnz scale + nnz scalar mul
+            work[1] += S.nnz // 2     # diagonal extraction (avg half-row scan)
     elif weighting == 'block':
         # Use block diagonal of S
         D_inv = get_block_diag(S, blocksize=S.blocksize[0], inv_flag=True)
@@ -166,7 +181,12 @@ def jacobi_prolongation_smoother(S, T, C, B, omega=4.0/3.0, degree=1,
                                    np.arange(D_inv.shape[0] + 1, dtype=np.int32)),
                                   shape=S.shape)
         D_inv_S = D_inv@S
-        D_inv_S = (omega/approximate_spectral_radius(D_inv_S))*D_inv_S
+        rho = approximate_spectral_radius(D_inv_S, work=work)
+        D_inv_S = (omega/rho)*D_inv_S
+        if work is not None:
+            blocksize = S.blocksize[0]
+            work[0] += n * blocksize**2 + 2 * S.nnz  # block inv + SpMM + scalar mul
+            work[1] += S.nnz // 2  # diagonal extraction
     elif weighting == 'local':
         # Use the Gershgorin estimate as each row's weight, instead of a global
         # spectral radius estimate
@@ -176,6 +196,9 @@ def jacobi_prolongation_smoother(S, T, C, B, omega=4.0/3.0, degree=1,
 
         D_inv_S = scale_rows(S, D_inv, copy=True)
         D_inv_S = omega*D_inv_S
+        if work is not None:
+            work[0] += S.nnz + n + S.nnz  # SpMV + n inversions + scale_rows
+            work[1] += S.nnz  # abs operations
     else:
         raise ValueError('Incorrect weighting option')
 
@@ -184,6 +207,10 @@ def jacobi_prolongation_smoother(S, T, C, B, omega=4.0/3.0, degree=1,
         # apply satisfy constraints so that U@B = 0
         P = T
         for _ in range(degree):
+            if work is not None:
+                spmm_cost = S.nnz * P.nnz // n
+                work[0] += spmm_cost + P.nnz  # SpMM + subtraction
+                work[1] += spmm_cost  # SpMM graph
             U = (D_inv_S@P).tobsr(blocksize=P.blocksize)
 
             # Enforce U@B = 0 (1) Construct array of inv(Bi'Bi), where Bi is B
@@ -201,12 +228,16 @@ def jacobi_prolongation_smoother(S, T, C, B, omega=4.0/3.0, degree=1,
         # Carry out Jacobi as normal
         P = T
         for _ in range(degree):
+            if work is not None:
+                spmm_cost = S.nnz * P.nnz // n
+                work[0] += spmm_cost + P.nnz  # SpMM + subtraction
+                work[1] += spmm_cost  # SpMM graph
             P = P - (D_inv_S @ P)
 
     return P
 
 
-def richardson_prolongation_smoother(S, T, omega=4.0/3.0, degree=1):
+def richardson_prolongation_smoother(S, T, omega=4.0/3.0, degree=1, work=None):
     """Richardson prolongation smoother.
 
     Parameters
@@ -221,6 +252,8 @@ def richardson_prolongation_smoother(S, T, omega=4.0/3.0, degree=1):
         Damping parameter.
     degree : int
         Number of passes.
+    work : list or None
+        If provided, a 2-element list [numerical_work, graph_work] to accumulate counts.
 
     Returns
     -------
@@ -263,17 +296,22 @@ def richardson_prolongation_smoother(S, T, omega=4.0/3.0, degree=1):
            [0.        , 0.64930164]])
 
     """
-    weight = omega/approximate_spectral_radius(S)
+    weight = omega/approximate_spectral_radius(S, work=work)
 
+    n = S.shape[0]
     P = T
     for _ in range(degree):
+        if work is not None:
+            spmm_cost = S.nnz * P.nnz // n
+            work[0] += spmm_cost + 2 * P.nnz  # SpMM + scalar mul + subtraction
+            work[1] += spmm_cost  # SpMM graph
         P = P - weight*(S@P)
 
     return P
 
 
 def cg_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter, tol,
-                              weighting='local', Cpt_params=None):
+                              weighting='local', Cpt_params=None, work=None):
     """Use CG to smooth T by solving A T = 0, subject to nullspace and sparsity constraints.
 
     Parameters
@@ -309,6 +347,8 @@ def cg_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter, tol,
         the injection matrix for the Cpts, (2) I_F: an identity matrix
         for only the F-points (i.e. I, but with zero rows and columns for
         C-points) and I_C: the C-point analogue to I_F.
+    work : list or None
+        If provided, a 2-element list [numerical_work, graph_work] to accumulate counts.
 
     Returns
     -------
@@ -329,18 +369,30 @@ def cg_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter, tol,
                            shape=pattern.shape)
 
     # CG will be run with diagonal preconditioning
+    n = A.shape[0]
+    k = B.shape[1]
     if weighting == 'diagonal':
         Dinv = get_diagonal(A, norm_eq=False, inv=True)
+        if work is not None:
+            work[0] += n  # n inversions
+            work[1] += A.nnz // 2  # diagonal extraction
     elif weighting == 'block':
         Dinv = get_block_diag(A, blocksize=A.blocksize[0], inv_flag=True)
         Dinv = sparse.bsr_array((Dinv, np.arange(Dinv.shape[0], dtype=np.int32),
                                  np.arange(Dinv.shape[0] + 1, dtype=np.int32)),
                                 shape=A.shape)
+        if work is not None:
+            blocksize = A.blocksize[0]
+            work[0] += n * blocksize * blocksize  # block inversions
+            work[1] += A.nnz // 2  # diagonal extraction
     elif weighting == 'local':
         # Based on Gershgorin estimate
         D = np.abs(A)@np.ones((A.shape[0], 1), dtype=A.dtype)
         Dinv = np.zeros_like(D)
         Dinv[D != 0] = 1.0 / np.abs(D[D != 0])
+        if work is not None:
+            work[0] += A.nnz + n  # SpMV + n inversions
+            work[1] += A.nnz  # abs operations
     else:
         raise ValueError('weighting value is invalid')
 
@@ -364,8 +416,14 @@ def cg_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter, tol,
                                      T.blocksize[1])
     R.data *= -1.0
 
+    if work is not None:
+        # Initial SpMM: A @ T restricted to pattern
+        spmm_cost = A.nnz * T.nnz // n
+        work[0] += spmm_cost
+        work[1] += spmm_cost
+
     # Enforce R@B = 0
-    satisfy_constraints(R, B, BtBinv)
+    satisfy_constraints(R, B, BtBinv, work=work)
 
     if R.nnz == 0:
         print('Error in sa_energy_min(..).  Initial R no nonzeros on a level. '
@@ -382,11 +440,17 @@ def cg_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter, tol,
         # Apply diagonal preconditioner
         if weighting in ('local', 'diagonal'):
             Z = scale_rows(R, Dinv)
+            if work is not None:
+                work[0] += R.nnz  # scale_rows
         else:
             Z = Dinv@R
+            if work is not None:
+                work[0] += A.nnz  # block diagonal SpMM
 
         # Frobenius inner-product of (R,Z) = sum( np.conjugate(rk).*zk)
         newsum = (R.conjugate().multiply(Z)).sum()
+        if work is not None:
+            work[0] += 2 * R.nnz  # conjugate + multiply + sum
         if newsum < tol:
             # met tolerance, so halt
             break
@@ -398,6 +462,8 @@ def cg_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter, tol,
         else:
             beta = newsum / oldsum
             P = Z + beta*P
+            if work is not None:
+                work[0] += 2 * P.nnz  # scalar mul + add
         oldsum = newsum
 
         # Calculate new direction and enforce constraints
@@ -416,18 +482,32 @@ def cg_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter, tol,
                                          A.blocksize[0], A.blocksize[1],
                                          P.blocksize[1])
 
+        if work is not None:
+            spmm_cost = A.nnz * P.nnz // n
+            work[0] += spmm_cost
+            work[1] += spmm_cost
+
         # Enforce AP@B = 0
-        satisfy_constraints(AP, B, BtBinv)
+        satisfy_constraints(AP, B, BtBinv, work=work)
 
         # Frobenius inner-product of (P, AP)
         alpha = newsum/(P.conjugate().multiply(AP)).sum()
+        if work is not None:
+            work[0] += 2 * P.nnz  # conjugate + multiply + sum
 
         # Update the prolongator, T
         T = T + alpha*P
+        if work is not None:
+            work[0] += 2 * T.nnz  # scalar mul + add
 
         # Ensure identity at C-pts
         if Cpt_params[0]:
             T = Cpt_params[1]['I_F']@T + Cpt_params[1]['P_I']
+            if work is not None:
+                # SpMM + sparse addition
+                I_F = Cpt_params[1]['I_F']
+                work[0] += I_F.nnz * T.nnz // n + T.nnz
+                work[1] += I_F.nnz * T.nnz // n
 
         # Update residual
         R = R - alpha*AP
@@ -443,7 +523,8 @@ def cg_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter, tol,
 
 
 def cgnr_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter,
-                                tol, weighting='diagonal', Cpt_params=None):
+                                tol, weighting='diagonal', Cpt_params=None,
+                                work=None):
     """Smooth T with CGNR by solving A T = 0, subject to nullspace and sparsity constraints.
 
     Parameters
@@ -481,6 +562,8 @@ def cgnr_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter,
         the injection matrix for the Cpts, (2) I_F: an identity matrix
         for only the F-points (i.e. I, but with zero rows and columns for
         C-points) and I_C: the C-point analogue to I_F.
+    work : list or None
+        If provided, a 2-element list [numerical_work, graph_work] to accumulate counts.
 
     Returns
     -------
@@ -509,7 +592,11 @@ def cgnr_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter,
                            shape=pattern.shape)
 
     # D for A.H@A
+    n = A.shape[0]
     Dinv = get_diagonal(A, norm_eq=1, inv=True)
+    if work is not None:
+        work[0] += n  # n inversions
+        work[1] += A.nnz // 2  # diagonal extraction
 
     # Calculate initial residual
     #   Equivalent to R = -Ah@(A@T);    R = R.multiply(pattern)
@@ -531,8 +618,18 @@ def cgnr_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter,
                                      Ah.blocksize[0], Ah.blocksize[1],
                                      T.blocksize[1])
 
+    if work is not None:
+        # A@T SpMM
+        spmm_cost_at = A.nnz * T.nnz // n
+        work[0] += spmm_cost_at
+        work[1] += spmm_cost_at
+        # Ah@AT SpMM (restricted to pattern)
+        spmm_cost_ah_at = Ah.nnz * AT.nnz // n
+        work[0] += spmm_cost_ah_at
+        work[1] += spmm_cost_ah_at
+
     # Enforce R@B = 0
-    satisfy_constraints(R, B, BtBinv)
+    satisfy_constraints(R, B, BtBinv, work=work)
 
     if R.nnz == 0:
         print('Error in sa_energy_min(..).  Initial R no nonzeros on a level. '
@@ -553,9 +650,13 @@ def cgnr_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter,
 
         # Apply diagonal preconditioner
         Z = scale_rows(R, Dinv)
+        if work is not None:
+            work[0] += R.nnz  # scale_rows
 
         # Frobenius innerproduct of (R,Z) = sum(rk.*zk)
         newsum = (R.conjugate().multiply(Z)).sum()
+        if work is not None:
+            work[0] += 2 * R.nnz  # conjugate + multiply + sum
         if newsum < tol:
             # met tolerance, so halt
             break
@@ -567,6 +668,8 @@ def cgnr_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter,
         else:
             beta = newsum/oldsum
             P = Z + beta*P
+            if work is not None:
+                work[0] += 2 * P.nnz  # scalar mul + add
         oldsum = newsum
 
         # Calculate new direction
@@ -585,23 +688,44 @@ def cgnr_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter,
                                          int(T.shape[1]/T.blocksize[1]),
                                          Ah.blocksize[0],
                                          Ah.blocksize[1], T.blocksize[1])
+
+        if work is not None:
+            # A@P SpMM
+            spmm_cost_ap = A.nnz * P.nnz // n
+            work[0] += spmm_cost_ap
+            work[1] += spmm_cost_ap
+            # Ah@AP_temp SpMM (restricted to pattern)
+            spmm_cost_ah_ap = Ah.nnz * AP_temp.nnz // n
+            work[0] += spmm_cost_ah_ap
+            work[1] += spmm_cost_ah_ap
         del AP_temp
 
         # Enforce AP@B = 0
-        satisfy_constraints(AP, B, BtBinv)
+        satisfy_constraints(AP, B, BtBinv, work=work)
 
         # Frobenius inner-product of (P, AP)
         alpha = newsum/(P.conjugate().multiply(AP)).sum()
+        if work is not None:
+            work[0] += 2 * P.nnz  # conjugate + multiply + sum
 
         # Update the prolongator, T
         T = T + alpha*P
+        if work is not None:
+            work[0] += 2 * T.nnz  # scalar mul + add
 
         # Ensure identity at C-pts
         if Cpt_params[0]:
             T = Cpt_params[1]['I_F']@T + Cpt_params[1]['P_I']
+            if work is not None:
+                # SpMM + sparse addition
+                I_F = Cpt_params[1]['I_F']
+                work[0] += I_F.nnz * T.nnz // n + T.nnz
+                work[1] += I_F.nnz * T.nnz // n
 
         # Update residual
         R = R - alpha*AP
+        if work is not None:
+            work[0] += 2 * R.nnz  # scalar mul + add
 
         i += 1
 
@@ -646,7 +770,8 @@ def apply_givens(Q, v, k):
 
 
 def gmres_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter,
-                                 tol, weighting='local', Cpt_params=None):
+                                 tol, weighting='local', Cpt_params=None,
+                                 work=None):
     """Smooth T with GMRES by solving A T = 0 subject to nullspace and sparsity constraints.
 
     Parameters
@@ -683,6 +808,8 @@ def gmres_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter,
         the injection matrix for the Cpts, (2) I_F: an identity matrix
         for only the F-points (i.e. I, but with zero rows and columns for
         C-points) and I_C: the C-point analogue to I_F.
+    work : list or None
+        If provided, a 2-element list [numerical_work, graph_work] to accumulate counts.
 
     Returns
     -------
@@ -714,18 +841,29 @@ def gmres_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter,
     H = np.zeros((maxiter+1, maxiter+1), dtype=xtype)
 
     # GMRES will be run with diagonal preconditioning
+    n = A.shape[0]
     if weighting == 'diagonal':
         Dinv = get_diagonal(A, norm_eq=False, inv=True)
+        if work is not None:
+            work[0] += n  # n inversions
+            work[1] += A.nnz // 2  # diagonal extraction
     elif weighting == 'block':
         Dinv = get_block_diag(A, blocksize=A.blocksize[0], inv_flag=True)
         Dinv = sparse.bsr_array((Dinv, np.arange(Dinv.shape[0], dtype=np.int32),
                                  np.arange(Dinv.shape[0] + 1, dtype=np.int32)),
                                  shape=A.shape)
+        if work is not None:
+            blocksize = A.blocksize[0]
+            work[0] += n * blocksize * blocksize  # block inversions
+            work[1] += A.nnz // 2  # diagonal extraction
     elif weighting == 'local':
         # Based on Gershgorin estimate
         D = np.abs(A)@np.ones((A.shape[0], 1), dtype=A.dtype)
         Dinv = np.zeros_like(D)
         Dinv[D != 0] = 1.0 / np.abs(D[D != 0])
+        if work is not None:
+            work[0] += A.nnz + n  # SpMV + n inversions
+            work[1] += A.nnz  # abs operations
     else:
         raise ValueError('weighting value is invalid')
 
@@ -748,14 +886,24 @@ def gmres_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter,
                                      T.blocksize[1])
     R.data *= -1.0
 
+    if work is not None:
+        # Initial A@T SpMM
+        spmm_cost = A.nnz * T.nnz // n
+        work[0] += spmm_cost
+        work[1] += spmm_cost
+
     # Apply diagonal preconditioner
     if weighting in ('local', 'diagonal'):
         R = scale_rows(R, Dinv)
+        if work is not None:
+            work[0] += R.nnz  # scale_rows
     else:
         R = Dinv@R
+        if work is not None:
+            work[0] += A.nnz  # block diagonal SpMM
 
     # Enforce R@B = 0
-    satisfy_constraints(R, B, BtBinv)
+    satisfy_constraints(R, B, BtBinv, work=work)
 
     if R.nnz == 0:
         print('Error in sa_energy_min(..).  Initial R no nonzeros on a level. '
@@ -798,13 +946,23 @@ def gmres_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter,
                                          A.blocksize[0], A.blocksize[1],
                                          T.blocksize[1])
 
+        if work is not None:
+            # A@V[i] SpMM
+            spmm_cost = A.nnz * V[i].nnz // n
+            work[0] += spmm_cost
+            work[1] += spmm_cost
+
         if weighting in ('local', 'diagonal'):
             AV = scale_rows(AV, Dinv)
+            if work is not None:
+                work[0] += AV.nnz  # scale_rows
         else:
             AV = Dinv@AV
+            if work is not None:
+                work[0] += A.nnz  # block diagonal SpMM
 
         # Enforce AV@B = 0
-        satisfy_constraints(AV, B, BtBinv)
+        satisfy_constraints(AV, B, BtBinv, work=work)
         V.append(AV.copy())
 
         # Modified Gram-Schmidt
@@ -812,9 +970,14 @@ def gmres_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter,
             # Frobenius inner-product
             H[j, i] = (V[j].conjugate().multiply(V[i+1])).sum()
             V[i+1] = V[i+1] - H[j, i]*V[j]
+            if work is not None:
+                # conjugate + multiply + sum + scalar mul + subtract
+                work[0] += 4 * V[j].nnz
 
         # Frobenius Norm
         H[i+1, i] = np.sqrt((V[i+1].data.conjugate()*V[i+1].data).sum())
+        if work is not None:
+            work[0] += 2 * V[i+1].nnz  # conjugate + multiply + sum + sqrt
 
         # Check for breakdown
         if H[i+1, i] != 0.0:
@@ -823,6 +986,9 @@ def gmres_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter,
         # Apply previous Givens rotations to H
         if i > 0:
             apply_givens(Q, H[:, i], i)
+            if work is not None:
+                # Each Givens rotation is a 2x2 matrix-vector product = 8 FMAs
+                work[0] += 8 * i
 
         # Calculate and apply next complex-valued Givens Rotation
         if H[i+1, i] != 0:
@@ -851,6 +1017,10 @@ def gmres_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter,
             H[i, i] = np.dot(Qblock[0, :], H[i:i+2, i])
             H[i+1, i] = 0.0
 
+            if work is not None:
+                # Givens construction + 2 applications = ~20 FMAs
+                work[0] += 20
+
         normr = np.abs(g[i+1])
         # print "Iteration " + str(i+1) + "   Normr  %1.3e"%normr
     # End while loop
@@ -858,8 +1028,13 @@ def gmres_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter,
     # Find best update to x in Krylov Space, V.  Solve (i x i) system.
     if i != -1:
         y = la.solve(H[0:i+1, 0:i+1], g[0:i+1])
+        if work is not None:
+            # Upper triangular solve: (i+1)^2 FMAs
+            work[0] += (i+1) * (i+1)
         for j in range(i+1):
             T = T + y[j]*V[j]
+            if work is not None:
+                work[0] += 2 * T.nnz  # scalar mul + add
 
     # vect = np.ravel((A@T).data)
     # print "Final Iteration " + str(i) + "   \
@@ -868,6 +1043,11 @@ def gmres_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter,
     # Ensure identity at C-pts
     if Cpt_params[0]:
         T = Cpt_params[1]['I_F']@T + Cpt_params[1]['P_I']
+        if work is not None:
+            # SpMM + sparse addition
+            I_F = Cpt_params[1]['I_F']
+            work[0] += I_F.nnz * T.nnz // n + T.nnz
+            work[1] += I_F.nnz * T.nnz // n
 
     return T
 
@@ -875,7 +1055,7 @@ def gmres_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter,
 def energy_prolongation_smoother(A, T, Atilde, B, Bf, Cpt_params,
                                  krylov='cg', maxiter=4, tol=1e-8,
                                  degree=1, weighting='local',
-                                 prefilter=None, postfilter=None):
+                                 prefilter=None, postfilter=None, work=None):
     """Minimize the energy of the coarse basis functions (columns of T).
 
     Both root-node and non-root-node style prolongation smoothing is available,
@@ -1060,6 +1240,7 @@ def energy_prolongation_smoother(A, T, Atilde, B, Bf, Cpt_params,
         return T
 
     # Expand allowed sparsity pattern for P through multiplication by Atilde
+    n = A.shape[0]
     if degree > 0:
 
         # Construct pattern by multiplying with Atilde
@@ -1071,16 +1252,21 @@ def energy_prolongation_smoother(A, T, Atilde, B, Bf, Cpt_params,
 
         AtildeCopy = Atilde.copy()
         for _ in range(degree):
+            if work is not None:
+                # SpGEMM: Atilde @ pattern
+                spmm_cost = Atilde.nnz * pattern.nnz // pattern.shape[0]
+                work[0] += spmm_cost
+                work[1] += spmm_cost
             pattern = AtildeCopy @ pattern
 
         # Optional filtering of sparsity pattern before smoothing
         if 'theta' in prefilter and 'k' in prefilter:
             pattern_theta = filter_matrix_rows(pattern, prefilter['theta'])
-            pattern = truncate_rows(pattern, prefilter['k'])
+            pattern = truncate_rows(pattern, prefilter['k'], work=work)
             # Union two sparsity patterns
             pattern += pattern_theta
         elif 'k' in prefilter:
-            pattern = truncate_rows(pattern, prefilter['k'])
+            pattern = truncate_rows(pattern, prefilter['k'], work=work)
         elif 'theta' in prefilter:
             pattern = filter_matrix_rows(pattern, prefilter['theta'])
         elif len(prefilter) > 0:
@@ -1095,11 +1281,11 @@ def energy_prolongation_smoother(A, T, Atilde, B, Bf, Cpt_params,
         pattern = T.copy()
         if 'theta' in prefilter and 'k' in prefilter:
             pattern_theta = filter_matrix_rows(pattern, prefilter['theta'])
-            pattern = truncate_rows(pattern, prefilter['k'])
+            pattern = truncate_rows(pattern, prefilter['k'], work=work)
             # Union two sparsity patterns
             pattern += pattern_theta
         elif 'k' in prefilter:
-            pattern = truncate_rows(pattern, prefilter['k'])
+            pattern = truncate_rows(pattern, prefilter['k'], work=work)
         elif 'theta' in prefilter:
             pattern = filter_matrix_rows(pattern, prefilter['theta'])
         elif len(prefilter) > 0:
@@ -1110,22 +1296,33 @@ def energy_prolongation_smoother(A, T, Atilde, B, Bf, Cpt_params,
 
     # If using root nodes, enforce identity at C-points
     if Cpt_params[0]:
-        pattern = Cpt_params[1]['I_F'] @ pattern
-        pattern = Cpt_params[1]['P_I'] + pattern
+        I_F = Cpt_params[1]['I_F']
+        P_I = Cpt_params[1]['P_I']
+        if work is not None:
+            # SpGEMM + sparse addition
+            spmm_cost = I_F.nnz * pattern.nnz // pattern.shape[0]
+            work[0] += spmm_cost + pattern.nnz
+            work[1] += spmm_cost
+        pattern = I_F @ pattern
+        pattern = P_I + pattern
 
     # Construct array of inv(Bi'Bi), where Bi is B restricted to row i's
     # sparsity pattern in pattern. This array is used multiple times
     # in satisfy_constraints(...).
-    BtBinv = compute_BtBinv(B, pattern)
+    BtBinv = compute_BtBinv(B, pattern, work=work)
 
     # If using root nodes and B has more columns that A's blocksize, then
     # T must be updated so that T@B = Bfine.  Note, if this is a 'secondpass'
     # after dropping entries in P, then we must re-enforce the constraints
     if ((Cpt_params[0] and (B.shape[1] > A.blocksize[0]))
        or ('secondpass' in postfilter)):
-        T = filter_operator(T, pattern, B, Bf, BtBinv)
+        T = filter_operator(T, pattern, B, Bf, BtBinv, work=work)
         # Ensure identity at C-pts
         if Cpt_params[0]:
+            if work is not None:
+                spmm_cost = I_F.nnz * T.nnz // n
+                work[0] += spmm_cost + T.nnz
+                work[1] += spmm_cost
             T = Cpt_params[1]['I_F']@T + Cpt_params[1]['P_I']
 
     # Iteratively minimize the energy of T subject to the constraints of
@@ -1133,13 +1330,13 @@ def energy_prolongation_smoother(A, T, Atilde, B, Bf, Cpt_params,
     # (T+Update)@B, i.e. Update@B = 0
     if krylov == 'cg':
         T = cg_prolongation_smoothing(A, T, B, BtBinv, pattern,
-                                      maxiter, tol, weighting, Cpt_params)
+                                      maxiter, tol, weighting, Cpt_params, work=work)
     elif krylov == 'cgnr':
         T = cgnr_prolongation_smoothing(A, T, B, BtBinv, pattern,
-                                        maxiter, tol, weighting, Cpt_params)
+                                        maxiter, tol, weighting, Cpt_params, work=work)
     elif krylov == 'gmres':
         T = gmres_prolongation_smoothing(A, T, B, BtBinv, pattern,
-                                         maxiter, tol, weighting, Cpt_params)
+                                         maxiter, tol, weighting, Cpt_params, work=work)
 
     T.eliminate_zeros()
 
@@ -1152,7 +1349,7 @@ def energy_prolongation_smoother(A, T, Atilde, B, Bf, Cpt_params,
 
     if 'theta' in postfilter and 'k' in postfilter:
         T_theta = filter_matrix_rows(T, postfilter['theta'])
-        T_k = truncate_rows(T, postfilter['k'])
+        T_k = truncate_rows(T, postfilter['k'], work=work)
 
         # Union two sparsity patterns
         T_theta.data[:] = 1.0
@@ -1162,7 +1359,7 @@ def energy_prolongation_smoother(A, T, Atilde, B, Bf, Cpt_params,
         T_filter = T.multiply(T_filter)
 
     elif 'k' in postfilter:
-        T_filter = truncate_rows(T, postfilter['k'])
+        T_filter = truncate_rows(T, postfilter['k'], work=work)
     elif 'theta' in postfilter:
         T_filter = filter_matrix_rows(T, postfilter['theta'])
     else:
@@ -1177,6 +1374,7 @@ def energy_prolongation_smoother(A, T, Atilde, B, Bf, Cpt_params,
                                      tol=1e-8, degree=0,
                                      weighting=weighting,
                                      prefilter={},
-                                     postfilter={'secondpass': True})
+                                     postfilter={'secondpass': True},
+                                     work=work)
 
     return T

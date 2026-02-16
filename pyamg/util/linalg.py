@@ -156,10 +156,11 @@ def _approximate_eigenvalues(A, maxiter, symmetric=None, initial_guess=None):
 
     Used by approximate_spectral_radius and condest.
 
-    Returns [W, E, H, V, breakdown_flag], where W and E are the eigenvectors
-    and eigenvalues of the Hessenberg matrix H, respectively, and V is the
-    Krylov space.  breakdown_flag denotes whether Lanczos/Arnoldi suffered
-    breakdown.  E is therefore the approximate eigenvalues of A.
+    Returns [W, E, H, V, breakdown_flag, nmatvecs], where W and E are the
+    eigenvectors and eigenvalues of the Hessenberg matrix H, respectively,
+    and V is the Krylov space.  breakdown_flag denotes whether Lanczos/Arnoldi
+    suffered breakdown.  E is therefore the approximate eigenvalues of A.
+    nmatvecs is the number of matrix-vector products performed.
 
     To obtain approximate eigenvectors of A, compute V*W.
 
@@ -249,12 +250,12 @@ def _approximate_eigenvalues(A, maxiter, symmetric=None, initial_guess=None):
 
     Eigs, Vects = eig(H[:j+1, :j+1], left=False, right=True)
 
-    return (Vects, Eigs, H, V, breakdown_flag)
+    return (Vects, Eigs, H, V, breakdown_flag, j + 1)
 
 
 def approximate_spectral_radius(A, tol=0.01, maxiter=15, restart=5,
                                 symmetric=None, initial_guess=None,
-                                return_vector=False):
+                                return_vector=False, work=None):
     """Approximate the spectral radius of a matrix.
 
     Parameters
@@ -345,9 +346,11 @@ def approximate_spectral_radius(A, tol=0.01, maxiter=15, restart=5,
             v0 = initial_guess.reshape(-1, 1)
             v0 = np.array(v0, dtype=A.dtype)
 
+        total_matvecs = 0
         for j in range(restart+1):
-            [evect, ev, H, V, breakdown_flag] =\
+            [evect, ev, H, V, breakdown_flag, nmatvecs] =\
                 _approximate_eigenvalues(A, maxiter, symmetric, initial_guess=v0)
+            total_matvecs += nmatvecs
             # Calculate error in dominant eigenvector
             nvecs = ev.shape[0]
             max_index = np.abs(ev).argmax()
@@ -372,12 +375,18 @@ def approximate_spectral_radius(A, tol=0.01, maxiter=15, restart=5,
         rho = np.abs(ev[max_index])
         if sparse.issparse(A):
             A.rho = rho
+            A.rho_matvecs = total_matvecs
+
+        # Count work: each matvec is nnz FMAs
+        if work is not None and sparse.issparse(A):
+            work[0] += total_matvecs * A.nnz
 
         if return_vector:
             return (rho, v0)
 
         return rho
 
+    # Cached result - no work to count
     return A.rho
 
 
@@ -426,9 +435,9 @@ def condest(A, maxiter=25, symmetric=False):
         C.matvec = matvec
         power = 0.5
 
-    [evect, ev, H, V, breakdown_flag] =\
+    [evect, ev, H, V, breakdown_flag, _nmatvecs] =\
         _approximate_eigenvalues(C, maxiter, symmetric)
-    del evect, H, V, breakdown_flag
+    del evect, H, V, breakdown_flag, _nmatvecs
 
     return (np.max([norm(x) for x in ev])/min(norm(x) for x in ev))**power
 

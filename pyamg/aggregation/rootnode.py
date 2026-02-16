@@ -300,18 +300,22 @@ def rootnode_solver(A, B=None, BH=None,
     if A.symmetry == 'nonsymmetric':
         levels[-1].BH = BH    # left candidates
 
+    # Track work: [numerical_work, graph_work]
+    work = [0, 0]
+
     while len(levels) < max_levels and \
             int(levels[-1].A.shape[0]/get_blocksize(levels[-1].A)) > max_coarse:
         _extend_hierarchy(levels, strength, aggregate, smooth,
-                          improve_candidates, diagonal_dominance, keep)
+                          improve_candidates, diagonal_dominance, keep, work)
 
     ml = MultilevelSolver(levels, **kwargs)
-    change_smoothers(ml, presmoother, postsmoother)
+    change_smoothers(ml, presmoother, postsmoother, work=work)
+    ml._setup_work = tuple(work)
     return ml
 
 
 def _extend_hierarchy(levels, strength, aggregate, smooth, improve_candidates,
-                      diagonal_dominance=False, keep=True):
+                      diagonal_dominance=False, keep=True, work=None):
     """Extend the multigrid hierarchy.
 
     Service routine to implement the strength of connection, aggregation,
@@ -319,6 +323,9 @@ def _extend_hierarchy(levels, strength, aggregate, smooth, improve_candidates,
     smoothed_aggregation_solver.
 
     """
+    if work is None:
+        work = [0, 0]
+
     def unpack_arg(v):
         if isinstance(v, tuple):
             return v[0], v[1]
@@ -333,25 +340,26 @@ def _extend_hierarchy(levels, strength, aggregate, smooth, improve_candidates,
     # Compute the strength-of-connection matrix C, where larger
     # C[i, j] denote stronger couplings between i and j.
     fn, kwargs = unpack_arg(strength[len(levels)-1])
+    n = A.shape[0]
     if fn == 'symmetric':
-        C = symmetric_strength_of_connection(A, **kwargs)
+        C = symmetric_strength_of_connection(A, work=work, **kwargs)
     elif fn == 'classical':
-        C = classical_strength_of_connection(A, **kwargs)
+        C = classical_strength_of_connection(A, work=work, **kwargs)
     elif fn == 'distance':
         C = distance_strength_of_connection(A, **kwargs)
     elif fn in ('ode', 'evolution'):
         if 'B' in kwargs:
-            C = evolution_strength_of_connection(A, **kwargs)
+            C = evolution_strength_of_connection(A, work=work, **kwargs)
         else:
-            C = evolution_strength_of_connection(A, B, **kwargs)
+            C = evolution_strength_of_connection(A, B, work=work, **kwargs)
     elif fn == 'energy_based':
-        C = energy_based_strength_of_connection(A, **kwargs)
+        C = energy_based_strength_of_connection(A, work=work, **kwargs)
     elif fn == 'predefined':
         C = kwargs['C'].tocsr()
     elif fn == 'algebraic_distance':
-        C = algebraic_distance(A, **kwargs)
+        C = algebraic_distance(A, work=work, **kwargs)
     elif fn == 'affinity':
-        C = affinity_distance(A, **kwargs)
+        C = affinity_distance(A, work=work, **kwargs)
     elif fn is None:
         C = A.tocsr()
     else:
@@ -361,19 +369,22 @@ def _extend_hierarchy(levels, strength, aggregate, smooth, improve_candidates,
     flag, kwargs = unpack_arg(diagonal_dominance)
     if flag:
         C = eliminate_diag_dom_nodes(A, C, **kwargs)
+        # Work: one pass over A computing off-diagonal row sums with abs
+        work[0] += A.nnz  # numerical (row sums + threshold multiply)
+        work[1] += A.nnz  # graph (abs operations)
 
     # Compute the aggregation matrix AggOp (i.e., the nodal coarsening of A).
     # AggOp is a boolean matrix, where the sparsity pattern for the k-th column
     # denotes the fine-grid nodes agglomerated into k-th coarse-grid node.
     fn, kwargs = unpack_arg(aggregate[len(levels)-1])
     if fn == 'standard':
-        AggOp, Cnodes = standard_aggregation(C, **kwargs)
+        AggOp, Cnodes = standard_aggregation(C, work=work, **kwargs)
     elif fn == 'naive':
-        AggOp, Cnodes = naive_aggregation(C, **kwargs)
+        AggOp, Cnodes = naive_aggregation(C, work=work, **kwargs)
     elif fn == 'lloyd':
-        AggOp, Cnodes = lloyd_aggregation(C, **kwargs)
+        AggOp, Cnodes = lloyd_aggregation(C, work=work, **kwargs)
     elif fn == 'pairwise':
-        AggOp, Cnodes = pairwise_aggregation(A, **kwargs)
+        AggOp, Cnodes = pairwise_aggregation(A, work=work, **kwargs)
     elif fn == 'predefined':
         AggOp = kwargs['AggOp'].tocsr()
         Cnodes = kwargs['Cnodes']
@@ -389,34 +400,65 @@ def _extend_hierarchy(levels, strength, aggregate, smooth, improve_candidates,
         if A.symmetry == 'nonsymmetric':
             BH = relaxation_as_linear_operator((fn, kwargs), AH, b) @ BH
             levels[-1].BH = BH
+        # Work: iterations * sweep_factor * nnz(A) * ncols(B) numerical.
+        # Assumes one smoother application = nnz(A) per RHS column.
+        # sweep_factor is 2 for symmetric sweep (forward + backward), 1 otherwise.
+        iterations = kwargs.get('iterations', 1)
+        sweep_factor = 2 if kwargs.get('sweep', 'forward') == 'symmetric' else 1
+        ncols = B.shape[1]
+        work[0] += iterations * sweep_factor * A.nnz * ncols
+        if A.symmetry == 'nonsymmetric':
+            work[0] += iterations * sweep_factor * A.nnz * ncols
 
     # Compute the tentative prolongator, T, which is a tentative interpolation
     # matrix from the coarse-grid to the fine-grid.  T exactly interpolates
     # B_fine[:, 0:get_blocksize(A)] = T B_coarse[:, 0:get_blocksize(A)].
-    T, dummy = fit_candidates(AggOp, B[:, 0:get_blocksize(A)])
+    T, dummy = fit_candidates(AggOp, B[:, 0:get_blocksize(A)], work=work)
     del dummy
     if A.symmetry == 'nonsymmetric':
-        TH, dummyH = fit_candidates(AggOp, BH[:, 0:get_blocksize(A)])
+        TH, dummyH = fit_candidates(AggOp, BH[:, 0:get_blocksize(A)], work=work)
         del dummyH
 
     # Create necessary root node matrices
     Cpt_params = (True, get_Cpt_params(A, Cnodes, AggOp, T))
+    # get_Cpt_params work: builds identity matrices and sparse manipulations
+    # ~6n graph for eye, eliminate_zeros, subtract, tobsr operations
+    work[1] += 6 * n
+
     T = scale_T(T, Cpt_params[1]['P_I'], Cpt_params[1]['I_F'])
+    # scale_T work:
+    #   D = P_I.T @ T: SpGEMM with sparse P_I (n_coarse entries)
+    #   pinv_array(D.data): dense block inverse
+    #   T = T @ D: SpGEMM
+    #   I_F @ T + P_I: SpGEMM + sparse add
+    # Approximation: 3 SpGEMMs with T, plus block inverse
+    P_I = Cpt_params[1]['P_I']
+    I_F = Cpt_params[1]['I_F']
+    n_coarse = P_I.shape[1]
+    scale_T_cost = 3 * T.nnz * n_coarse // n + n_coarse  # SpGEMMs + block inv
+    work[0] += scale_T_cost + T.nnz  # numerical: SpGEMMs + block inv + sparse add
+    work[1] += scale_T_cost  # graph: SpGEMMs
+
     if A.symmetry == 'nonsymmetric':
         TH = scale_T(TH, Cpt_params[1]['P_I'], Cpt_params[1]['I_F'])
+        work[0] += scale_T_cost + TH.nnz  # numerical: SpGEMMs + block inv + sparse add
+        work[1] += scale_T_cost  # graph: SpGEMMs
 
     # Set coarse grid near nullspace modes as injected fine grid near
     # null-space modes
     B = Cpt_params[1]['P_I'].T@levels[-1].B
+    # P_I.T @ B: SpMM, ~n_coarse * ncols numerical
+    work[0] += n_coarse * levels[-1].B.shape[1]
     if A.symmetry == 'nonsymmetric':
         BH = Cpt_params[1]['P_I'].T@levels[-1].BH
+        work[0] += n_coarse * levels[-1].BH.shape[1]
 
     # Smooth the tentative prolongator, so that it's accuracy is greatly
     # improved for algebraically smooth error.
     fn, kwargs = unpack_arg(smooth[len(levels)-1])
     if fn == 'energy':
         P = energy_prolongation_smoother(A, T, C, B, levels[-1].B,
-                                         Cpt_params=Cpt_params, **kwargs)
+                                         Cpt_params=Cpt_params, **kwargs, work=work)
     elif fn is None:
         P = T
     else:
@@ -433,13 +475,17 @@ def _extend_hierarchy(levels, strength, aggregate, smooth, improve_candidates,
     elif symmetry == 'nonsymmetric':
         fn, kwargs = unpack_arg(smooth[len(levels)-1])
         if fn == 'energy':
-            R = energy_prolongation_smoother(AH, TH, C, BH, levels[-1].BH,
-                                             Cpt_params=Cpt_params, **kwargs)
-            R = R.T.conjugate()
+            RH = energy_prolongation_smoother(AH, TH, C, BH, levels[-1].BH,
+                                              Cpt_params=Cpt_params, **kwargs, work=work)
+            R = RH.T.conjugate()
         elif fn is None:
             R = T.T.conjugate()
         else:
             raise ValueError(f'Unrecognized prolongation smoother method: {fn!s}')
+
+    # Work: nnz(P) graph for transpose (CSR to CSC conversion)
+    if symmetry in ('hermitian', 'symmetric'):
+        work[1] += P.nnz
 
     if keep:
         levels[-1].C = C                         # strength of connection matrix
@@ -454,6 +500,12 @@ def _extend_hierarchy(levels, strength, aggregate, smooth, improve_candidates,
     levels[-1].R = R                             # restriction operator
     levels[-1].Cpts = Cpt_params[1]['Cpts']      # Cpts (i.e., rootnodes)
 
+    # RAP (Galerkin triple product): Two SpGEMMs with equal graph and numerical cost.
+    # Approximates sparse mat-mat A @ B as nnz(A) * avg_nnz_per_row(B).
+    rap_cost = R.nnz * A.nnz // A.shape[0] + A.nnz * P.nnz // P.shape[0]
+    work[0] += rap_cost  # numerical
+    work[1] += rap_cost  # graph
+
     levels.append(MultilevelSolver.Level())
     A = R @ A @ P                                # Galerkin operator
     A.symmetry = symmetry
@@ -461,4 +513,4 @@ def _extend_hierarchy(levels, strength, aggregate, smooth, improve_candidates,
     levels[-1].B = B                             # right near nullspace candidates
 
     if A.symmetry == 'nonsymmetric':
-        levels[-1].BH = BH                       # left near nullspace candidates
+        levels[-1].BH = BH     # left near nullspace candidates

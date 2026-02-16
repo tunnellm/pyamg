@@ -108,20 +108,27 @@ def ruge_stuben_solver(A,
 
     levels[-1].A = A
 
+    # Track work: [numerical_work, graph_work]
+    work = [0, 0]
+
     while len(levels) < max_levels and levels[-1].A.shape[0] > max_coarse:
-        bottom = _extend_hierarchy(levels, strength, CF, interpolation, keep)
+        bottom = _extend_hierarchy(levels, strength, CF, interpolation, keep, work)
 
         if bottom:
             break
 
     ml = MultilevelSolver(levels, **kwargs)
-    change_smoothers(ml, presmoother, postsmoother)
+    change_smoothers(ml, presmoother, postsmoother, work=work)
+    ml._setup_work = tuple(work)
     return ml
 
 
 # internal function
-def _extend_hierarchy(levels, strength, CF, interpolation, keep):
+def _extend_hierarchy(levels, strength, CF, interpolation, keep, work=None):
     """Extend the multigrid hierarchy."""
+    if work is None:
+        work = [0, 0]
+
     def unpack_arg(v):
         if isinstance(v, tuple):
             return v[0], v[1]
@@ -132,39 +139,50 @@ def _extend_hierarchy(levels, strength, CF, interpolation, keep):
     # Compute the strength-of-connection matrix C, where larger
     # C[i,j] denote stronger couplings between i and j.
     fn, kwargs = unpack_arg(strength)
+    n = A.shape[0]
     if fn == 'symmetric':
-        C = symmetric_strength_of_connection(A, **kwargs)
+        C = symmetric_strength_of_connection(A, work=work, **kwargs)
     elif fn == 'classical':
-        C = classical_strength_of_connection(A, **kwargs)
+        C = classical_strength_of_connection(A, work=work, **kwargs)
     elif fn == 'distance':
         C = distance_strength_of_connection(A, **kwargs)
     elif fn in ('ode', 'evolution'):
-        C = evolution_strength_of_connection(A, **kwargs)
+        C = evolution_strength_of_connection(A, work=work, **kwargs)
     elif fn == 'energy_based':
-        C = energy_based_strength_of_connection(A, **kwargs)
+        C = energy_based_strength_of_connection(A, work=work, **kwargs)
     elif fn == 'algebraic_distance':
-        C = algebraic_distance(A, **kwargs)
+        C = algebraic_distance(A, work=work, **kwargs)
     elif fn == 'affinity':
-        C = affinity_distance(A, **kwargs)
+        C = affinity_distance(A, work=work, **kwargs)
     elif fn is None:
         C = A
     else:
         raise ValueError(f'Unrecognized strength of connection method: {fn}')
 
     # Generate the C/F splitting
+    # All coarsening algorithms are iterative graph algorithms over C.
+    # Numerical: nnz(C) + n for measure computation (lambda + random augmentation)
+    # Graph: C_iter * 2*nnz(C) for IS selection iterations (traverse C and C^T)
+    # C_iter varies: RS~2, PMIS/CLJP~3 iterations on average
     fn, kwargs = unpack_arg(CF)
     if fn == 'RS':
-        splitting = split.RS(C, **kwargs)
+        splitting = split.RS(C, work=work, **kwargs)
+        # RS work counted inside split.RS
     elif fn == 'PMIS':
-        splitting = split.PMIS(C, **kwargs)
+        splitting = split.PMIS(C, work=work, **kwargs)
+        # PMIS work counted inside split.PMIS (preprocessing + MIS iterations)
     elif fn == 'PMISc':
-        splitting = split.PMISc(C, **kwargs)
+        splitting = split.PMISc(C, work=work, **kwargs)
+        # PMISc work counted inside split.PMISc (preprocessing + coloring + MIS iterations)
     elif fn == 'CLJP':
-        splitting = split.CLJP(C, **kwargs)
+        splitting = split.CLJP(C, work=work, **kwargs)
+        # CLJP work counted inside split.CLJP (preprocessing + iterations)
     elif fn == 'CLJPc':
-        splitting = split.CLJPc(C, **kwargs)
+        splitting = split.CLJPc(C, work=work, **kwargs)
+        # CLJPc work counted inside split.CLJPc (delegates to CLJP with color=True)
     elif fn == 'CR':
-        splitting = CR(C, **kwargs)
+        splitting = CR(C, work=work, **kwargs)
+        # CR work counted inside CR (actual GS iterations + cr_helper)
     else:
         raise ValueError(f'Unknown C/F splitting method {CF}')
 
@@ -177,16 +195,54 @@ def _extend_hierarchy(levels, strength, CF, interpolation, keep):
     # Generate the interpolation matrix that maps from the coarse-grid to the
     # fine-grid
     fn, kwargs = unpack_arg(interpolation)
+    # Estimate nnz(C_FF) ≈ nnz(C)/2 (half of strong connections are F-F)
+    # Estimate nnz(A_F) ≈ nnz(A)/2, nnz(C_F) ≈ nnz(C)/2 (half the rows are F-points)
+    nnz_C_FF = C.nnz // 2
+    nnz_A_F = A.nnz // 2
+    nnz_C_F = C.nnz // 2
     if fn == 'classical':
         P = classical_interpolation(A, C, splitting, **kwargs)
+        # Pre-processing (Python wrapper): NOT counted (memory copies, scipy overhead)
+        # remove_strong_FF_connections: nnz(C_FF)*nnz(C)/n graph (search S_j for common C-pts)
+        ff_search_cost = nnz_C_FF * C.nnz // n
+        work[1] += ff_search_cost  # graph: FF connection removal search
+        # Pass 1: traverse C for F-points = nnz(C_F) graph
+        # Pass 2 for each F-point i:
+        #   - Sum A row for denominator: nnz(A_F) adds
+        #   - Subtract strong connections from denominator: nnz(S_F) ≈ nnz(C)/2 subtracts
+        #   - For each strong F-neighbor k:
+        #     - Search A_k for a_kj: nnz(A)/n graph per search
+        #     - Inner denominator: search A_k for each C-neighbor: nnz(A)/n graph
+        #     - Arithmetic (a_ik * a_kj / denom, accumulate): 2 numerical ops per search
+        #   - Final weight = -numerator/denominator: 2 ops per P entry
+        # Graph: search cost ≈ nnz(C_FF) * nnz(A) / n
+        # Numerical: 2× search cost (a_kj lookup + inner_denom) + 2*(nnz(P)-n_C) normalization
+        n_C = P.shape[1]
+        search_cost = nnz_C_FF * A.nnz // n
+        work[1] += 2 * n + nnz_C_F + search_cost + P.nnz  # graph: pass1 + remap(n+nnz_P) + A-row searches
+        work[0] += nnz_A_F + nnz_C_F + 2 * search_cost + 2 * (P.nnz - n_C)  # numerical
     elif fn == 'direct':
         P = direct_interpolation(A, C, splitting, **kwargs)
+        # Pre-processing (Python wrapper): NOT counted (memory copies, scipy overhead)
+        # Pass 1: traverse C for F-points = nnz(C_F) graph
+        # Pass 2 for each F-point i:
+        #   - Sum strong pos/neg over S row: nnz(S_F) ≈ nnz(C)/2 comparisons + adds
+        #   - Sum all pos/neg over A row: nnz(A_F) ≈ nnz(A)/2 adds
+        #   - 4 divisions per F-point for alpha, beta, neg_coeff, pos_coeff: n_F
+        #   - 1 mul per P entry for weight: nnz(P) - n_C
+        # Final remap: n + nnz(P) graph
+        n_C = P.shape[1]
+        n_F = n - n_C
+        work[1] += 2 * n + nnz_C_F + P.nnz  # graph: pass1 traversal + remap(n+nnz_P)
+        work[0] += nnz_A_F + nnz_C_F + 4 * n_F + (P.nnz - n_C)  # numerical
     else:
         raise ValueError(f'Unknown interpolation method {interpolation}')
 
     # Generate the restriction matrix that maps from the fine-grid to the
     # coarse-grid
     R = P.T.tocsr()
+    # Work: nnz(P) graph for transpose
+    work[1] += P.nnz
 
     # Store relevant information for this level
     if keep:
@@ -195,6 +251,12 @@ def _extend_hierarchy(levels, strength, CF, interpolation, keep):
     levels[-1].splitting = splitting.astype(bool)  # C/F splitting
     levels[-1].P = P                               # prolongation operator
     levels[-1].R = R                               # restriction operator
+
+    # RAP (Galerkin triple product): Two SpGEMMs with equal graph and numerical cost.
+    # Approximates sparse mat-mat A @ B as nnz(A) * avg_nnz_per_row(B).
+    rap_cost = R.nnz * A.nnz // A.shape[0] + A.nnz * P.nnz // P.shape[0]
+    work[0] += rap_cost  # numerical
+    work[1] += rap_cost  # graph
 
     # Form next level through Galerkin product
     levels.append(MultilevelSolver.Level())

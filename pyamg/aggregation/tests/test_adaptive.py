@@ -16,7 +16,7 @@ class TestAdaptiveSA(TestCase):
     def test_poisson(self):
         A = poisson((50, 50), format='csr')
 
-        [asa, _work] = adaptive_sa_solver(A, num_candidates=1)
+        asa = adaptive_sa_solver(A, num_candidates=1)
         sa = smoothed_aggregation_solver(A, B=np.ones((A.shape[0], 1)))
 
         b = np.random.rand(A.shape[0])
@@ -41,9 +41,9 @@ class TestAdaptiveSA(TestCase):
         A, B = linear_elasticity((35, 35), format='bsr')
 
         smoother = ('gauss_seidel', {'sweep': 'symmetric', 'iterations': 2})
-        [asa, _work] = adaptive_sa_solver(A, num_candidates=3,
-                                         improvement_iters=5,
-                                         prepostsmoother=smoother)
+        asa = adaptive_sa_solver(A, num_candidates=3,
+                                 improvement_iters=5,
+                                 prepostsmoother=smoother)
         sa = smoothed_aggregation_solver(A, B=B)
 
         b = np.random.rand(A.shape[0])
@@ -73,12 +73,12 @@ class TestAdaptiveSA(TestCase):
 
         np.random.seed(111908910)
         sa_old = adaptive_sa_solver(A, initial_candidates=np.ones((49, 1)),
-                                    max_coarse=10)[0]
+                                    max_coarse=10)
         for AA in cases:
             np.random.seed(111908910)
             sa_new = adaptive_sa_solver(AA,
                                         initial_candidates=np.ones((49, 1)),
-                                        max_coarse=10)[0]
+                                        max_coarse=10)
             assert (abs(np.ravel(sa_old.levels[-1].A.toarray()
                     - sa_new.levels[-1].A.toarray())).max()) < 0.01
             sa_old = sa_new
@@ -107,7 +107,7 @@ class TestComplexAdaptiveSA(TestCase):
         # cases.append((Ai,0.8))
 
         for A, rratio in cases:
-            [asa, _work] = adaptive_sa_solver(A, num_candidates=1, symmetry='symmetric')
+            asa = adaptive_sa_solver(A, num_candidates=1, symmetry='symmetric')
             # sa = smoothed_aggregation_solver(A, B = np.ones((A.shape[0],1)) )
 
             b = np.zeros((A.shape[0],))

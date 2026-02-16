@@ -14,6 +14,20 @@ from .relaxation import smoothing
 from .util import upcast
 
 
+def _get_coarse_solver_name(solver):
+    """Extract solver name from coarse_solver repr like "coarse_grid_solver('pinv')"."""
+    if solver is None:
+        return None
+    solver_str = str(solver)
+    for quote in ("'", '"'):
+        if quote in solver_str:
+            start = solver_str.find(quote) + 1
+            end = solver_str.find(quote, start)
+            if end > start:
+                return solver_str[start:end]
+    return None
+
+
 class MultilevelSolver:
     """Stores multigrid hierarchy and implements the multigrid cycle.
 
@@ -71,6 +85,8 @@ class MultilevelSolver:
         A measure of the rate of coarsening.
     operator_complexity()
         A measure of the size of the multigrid hierarchy.
+    setup_complexity()
+        A measure of the cost to construct the hierarchy.
     solve()
         Iteratively solves a linear system for the right hand side.
     change_solve_matrix(A)
@@ -194,6 +210,9 @@ class MultilevelSolver:
         output += f'Number of Levels:     {len(self.levels)}\n'
         output += f'Operator Complexity:  {self.operator_complexity():6.3f}\n'
         output += f'Grid Complexity:      {self.grid_complexity():6.3f}\n'
+        if hasattr(self, '_setup_work'):
+            num_work, graph_work = self.setup_complexity()
+            output += f'Setup Complexity:     {num_work:6.3f} (numerical), {graph_work:6.3f} (graph)\n'
         output += f'Coarse Solver:        {self.coarse_solver.name()}\n'
 
         total_nnz = sum(level.A.nnz for level in self.levels)
@@ -209,7 +228,7 @@ class MultilevelSolver:
         return output
 
     def cycle_complexity(self, cycle='V'):
-        """Cycle complexity of V, W, AMLI, and F(1,1) cycle with simple relaxation.
+        """Cycle complexity of V, W, AMLI, and F(1,1) cycle.
 
         Cycle complexity is an approximate measure of the number of
         floating point operations (FLOPs) required to perform a single
@@ -230,58 +249,187 @@ class MultilevelSolver:
 
         Notes
         -----
-        This is only a rough estimate of the true cycle complexity. The
-        estimate assumes that the cost of pre and post-smoothing are
-        (each) equal to the number of nonzeros in the matrix on that level.
-        This assumption holds for smoothers like Jacobi and Gauss-Seidel.
-        However, the true cycle complexity of cycle using more expensive
-        methods, like block Gauss-Seidel will be underestimated.
+        Accounts for smoother iterations, Chebyshev polynomial degree,
+        block matrix overhead, residual computation, and grid transfers.
 
-        Additionally, if the cycle used in practice isn't a (1,1)-cycle,
-        then this cost estimate will be off.
+        Block smoothers on BSR matrices have additional cost proportional
+        to blocksize^2 for block inversions.
+
+        If no smoothers are defined, assumes cost of 1 per nnz for each
+        of pre- and post-smoothing (total cost 2 per level).
 
         """
+        import functools
+
+        def smoother_cost(smoother, A):
+            """Compute cost multiplier for a smoother relative to nnz(A)."""
+            if smoother is None:
+                return 1  # default cost when no smoother specified
+
+            iterations = 1
+            degree = 1
+            sweep_factor = 1
+
+            if isinstance(smoother, functools.partial):
+                iterations = smoother.keywords.get('iterations', 1)
+                sweep = smoother.keywords.get('sweep', 'forward')
+                if sweep == 'symmetric':
+                    sweep_factor = 2  # forward + backward
+            elif callable(smoother):
+                # Check for closure variables (Chebyshev, gauss_seidel_ne, etc.)
+                if hasattr(smoother, '__closure__') and smoother.__closure__:
+                    for varname, cell in zip(smoother.__code__.co_freevars,
+                                             smoother.__closure__):
+                        if varname == 'coefficients':
+                            degree = len(cell.cell_contents)
+                        elif varname == 'iterations':
+                            iterations = cell.cell_contents
+                        elif varname == 'sweep':
+                            if cell.cell_contents == 'symmetric':
+                                sweep_factor = 2
+
+            # Block smoother overhead: blocksize^2 for block inversions
+            blocksize = getattr(A, 'blocksize', (1, 1))[0]
+            block_factor = blocksize * blocksize if blocksize > 1 else 1
+
+            # Normal equations methods (gauss_seidel_ne/nr, jacobi_ne, cgne, cgnr)
+            # operate on A @ A.H or A.H @ A, requiring 2 SpMVs per iteration.
+            ne_factor = 1
+            smoother_name = getattr(smoother, '__name__', '')
+            if smoother_name.endswith(('_ne', '_nr', 'cgne', 'cgnr')):
+                ne_factor = 2
+
+            # GMRES has additional Arnoldi orthogonalization cost O(n*k^2)
+            if smoother_name == 'gmres':
+                # Extract maxiter from closure
+                maxiter = 1
+                if hasattr(smoother, '__closure__') and smoother.__closure__:
+                    for varname, cell in zip(smoother.__code__.co_freevars,
+                                             smoother.__closure__):
+                        if varname == 'maxiter':
+                            maxiter = cell.cell_contents
+                            break
+                # Cost: k SpMVs + n*k^2 Arnoldi orthogonalization
+                n = A.shape[0]
+                return maxiter + n * maxiter * maxiter / A.nnz
+
+            # Schwarz: cost is sum of subdomain_size^2 for dense block solves
+            if smoother_name == 'schwarz':
+                subdomain_ptr = None
+                schwarz_iters = 1
+                schwarz_sweep = 1
+                if hasattr(smoother, '__closure__') and smoother.__closure__:
+                    for varname, cell in zip(smoother.__code__.co_freevars,
+                                             smoother.__closure__):
+                        if varname == 'subdomain_ptr':
+                            subdomain_ptr = cell.cell_contents
+                        elif varname == 'iterations':
+                            schwarz_iters = cell.cell_contents
+                        elif varname == 'sweep':
+                            if cell.cell_contents == 'symmetric':
+                                schwarz_sweep = 2
+                if subdomain_ptr is not None:
+                    sizes = subdomain_ptr[1:] - subdomain_ptr[:-1]
+                    total_cost = np.sum(sizes * sizes) * schwarz_iters * schwarz_sweep
+                    return total_cost / A.nnz
+                # Fallback: assume average subdomain size is nnz/n
+                return A.nnz / A.shape[0] * iterations * sweep_factor
+
+            return iterations * degree * sweep_factor * block_factor * ne_factor
+
         cycle = str(cycle).upper()
 
-        nnz = [level.A.nnz for level in self.levels]
+        # Compute per-level costs: smoothing + residual + grid transfers
+        costs = []
+        for level in self.levels[:-1]:
+            pre_cost = smoother_cost(getattr(level, 'presmoother', None), level.A)
+            post_cost = smoother_cost(getattr(level, 'postsmoother', None), level.A)
+            smooth_work = (pre_cost + post_cost) * level.A.nnz
+
+            # Residual computation: r = b - A @ x
+            residual_work = level.A.nnz
+
+            # Grid transfers: restriction R @ r and interpolation P @ e
+            R_nnz = level.R.nnz if hasattr(level, 'R') else 0
+            P_nnz = level.P.nnz if hasattr(level, 'P') else 0
+            transfer_work = R_nnz + P_nnz
+
+            costs.append(smooth_work + residual_work + transfer_work)
+
+        # Coarsest level cost
+        coarse_A = self.levels[-1].A
+        coarse_n = coarse_A.shape[0]
+        coarse_solver = getattr(self, 'coarse_solver', None)
+
+        # Dense solvers: O(n^2) per solve (forward/back substitution or mat-vec)
+        # Sparse solvers: O(nnz) per solve
+        dense_solvers = {'pinv', 'pinv2', 'lu', 'cholesky'}
+        solver_name = _get_coarse_solver_name(coarse_solver)
+        if solver_name in dense_solvers:
+            coarse_cost = coarse_n * coarse_n
+        else:
+            coarse_cost = coarse_A.nnz
 
         def V(level):
             if len(self.levels) == 1:
-                return nnz[0]
+                return coarse_cost
 
             if level == len(self.levels) - 2:
-                return 2 * nnz[level] + nnz[level + 1]
+                return costs[level] + coarse_cost
 
-            return 2 * nnz[level] + V(level + 1)
+            return costs[level] + V(level + 1)
 
         def W(level):
             if len(self.levels) == 1:
-                return nnz[0]
+                return coarse_cost
 
             if level == len(self.levels) - 2:
-                return 2 * nnz[level] + nnz[level + 1]
+                return costs[level] + coarse_cost
 
-            return 2 * nnz[level] + 2 * W(level + 1)
+            return costs[level] + 2 * W(level + 1)
 
         def F(level):
             if len(self.levels) == 1:
-                return nnz[0]
+                return coarse_cost
 
             if level == len(self.levels) - 2:
-                return 2 * nnz[level] + nnz[level + 1]
+                return costs[level] + coarse_cost
 
-            return 2 * nnz[level] + F(level + 1) + V(level + 1)
+            return costs[level] + F(level + 1) + V(level + 1)
+
+        def AMLI(level):
+            """AMLI cycle: like W-cycle but with orthogonalization overhead.
+
+            With nAMLI=2, each AMLI application does 2 recursive solves
+            plus Gram-Schmidt orthogonalization in the A-norm:
+              k=0: 1 SpMV(Ac) + 4*n_c (step size + update)
+              k=1: 3 SpMV(Ac) + 7*n_c (orthog + step size + update)
+            Total overhead: 4*nnz(Ac) + 11*n_c per application.
+            """
+            if len(self.levels) == 1:
+                return coarse_cost
+
+            if level == len(self.levels) - 2:
+                return costs[level] + coarse_cost
+
+            # Orthogonalization overhead at coarse level (level+1)
+            Ac = self.levels[level + 1].A
+            amli_overhead = 4 * Ac.nnz + 11 * Ac.shape[0]
+
+            return costs[level] + 2 * AMLI(level + 1) + amli_overhead
 
         if cycle == 'V':
             flops = V(0)
-        elif cycle in ('W', 'AMLI'):
+        elif cycle == 'W':
             flops = W(0)
+        elif cycle == 'AMLI':
+            flops = AMLI(0)
         elif cycle == 'F':
             flops = F(0)
         else:
             raise TypeError(f'Unrecognized cycle type ({cycle})')
 
-        return float(flops) / float(nnz[0])
+        return float(flops) / float(self.levels[0].A.nnz)
 
     def operator_complexity(self):
         """Operator complexity of this multigrid hierarchy.
@@ -316,6 +464,80 @@ class MultilevelSolver:
         """
         return sum(level.A.shape[0] for level in self.levels) /\
             float(self.levels[0].A.shape[0])
+
+    def setup_complexity(self):
+        """Setup complexity of building this multigrid hierarchy.
+
+        Returns a measure of the computational work expended during the
+        construction of the multigrid hierarchy, relative to the number
+        of nonzeros on the finest level.
+
+        Returns
+        -------
+        tuple (float, float)
+            A tuple of (numerical_work, graph_work) where:
+            - numerical_work: Floating point operations normalized by nnz(A_0).
+              This includes sparse matrix arithmetic, interpolation construction,
+              prolongation smoothing, and Galerkin products.
+            - graph_work: Integer/graph operations normalized by nnz(A_0).
+              This includes strength of connection pattern traversal,
+              aggregation/C-F splitting, and sparse matrix structure operations.
+
+        Notes
+        -----
+        This is only a rough estimate of the true setup complexity. The
+        estimate assumes that:
+        - Sparse matrix-matrix products cost proportional to the sum of
+          input and output nonzeros
+        - Strength of connection computation costs proportional to nnz(A)
+        - Aggregation/splitting costs proportional to nnz(C)
+        - Prolongation smoothing costs depend on the method used
+
+        The work estimates are tracked during hierarchy construction in
+        the solver routines (ruge_stuben_solver, smoothed_aggregation_solver,
+        rootnode_solver).
+
+        """
+        if not hasattr(self, '_setup_work'):
+            return (0.0, 0.0)
+
+        nnz0 = float(self.levels[0].A.nnz)
+        numerical_work, graph_work = self._setup_work
+
+        # Add smoother setup work: spectral radius estimation for relaxation.
+        # Chebyshev: approximate_spectral_radius(A) -> rho_matvecs SpMVs
+        # Jacobi/block_jacobi/jacobi_ne: get_diagonal O(n) + scale_rows O(nnz)
+        #   + approximate_spectral_radius(D_inv_A) -> rho_D_inv_matvecs SpMVs
+        for level in self.levels[:-1]:
+            if hasattr(level.A, 'rho_D_inv'):
+                matvecs = getattr(level.A, 'rho_D_inv_matvecs', 15)
+                numerical_work += (2 + matvecs) * level.A.nnz
+            elif hasattr(level.A, 'rho'):
+                matvecs = getattr(level.A, 'rho_matvecs', 15)
+                numerical_work += matvecs * level.A.nnz
+
+        # Add coarse solver factorization cost
+        # Dense factorization costs (FMA convention: each a -= b*c is 1 FMA):
+        #   Cholesky (dpotrf): n³/6 FMAs
+        #   LU (dgetrf):       n³/3 FMAs
+        #   SVD/pinv: ~3n³ FMAs (rough estimate; SVD not purely FMA-dominated)
+        # Sparse factorization (splu): O(nnz) to O(n*nnz) depending on fill-in
+        coarse_A = self.levels[-1].A
+        coarse_n = coarse_A.shape[0]
+        coarse_solver = getattr(self, 'coarse_solver', None)
+
+        solver_name = _get_coarse_solver_name(coarse_solver)
+        if solver_name == 'cholesky':
+            numerical_work += coarse_n * coarse_n * coarse_n // 6
+        elif solver_name == 'lu':
+            numerical_work += coarse_n * coarse_n * coarse_n // 3
+        elif solver_name in ('pinv', 'pinv2'):
+            numerical_work += 3 * coarse_n * coarse_n * coarse_n
+        elif solver_name == 'splu':
+            # Sparse LU: estimate as O(nnz) for well-structured matrices
+            numerical_work += coarse_A.nnz
+
+        return (numerical_work / nnz0, graph_work / nnz0)
 
     def change_solve_matrix(self, A):
         """Change matrix solve/preconditioning matrix.

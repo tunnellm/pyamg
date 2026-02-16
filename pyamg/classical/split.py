@@ -96,7 +96,7 @@ from pyamg import amg_core
 from pyamg.util.utils import remove_diagonal
 
 
-def RS(S, second_pass=False):
+def RS(S, second_pass=False, work=None):
     """Compute a C/F splitting using Ruge-Stuben coarsening.
 
     Parameters
@@ -107,6 +107,8 @@ def RS(S, second_pass=False):
     second_pass : bool, default False
         Perform second pass of classical AMG coarsening. Can be important for
         classical AMG interpolation. Typically not done in parallel (e.g. Hypre).
+    work : list or None
+        If provided, a 2-element list [numerical_work, graph_work] to accumulate counts.
 
     Returns
     -------
@@ -134,25 +136,33 @@ def RS(S, second_pass=False):
     """
     if not issparse(S) or S.format != 'csr':
         raise TypeError('expected csr_array')
+    n = S.shape[0]
+    nnz_S = S.nnz
     S = remove_diagonal(S)
 
     T = S.T.tocsr()  # transpose S for efficient column access
-    splitting = np.empty(S.shape[0], dtype='intc')
-    influence = np.zeros((S.shape[0],), dtype='intc')
+    splitting = np.empty(n, dtype='intc')
+    influence = np.zeros((n,), dtype='intc')
 
-    amg_core.rs_cf_splitting(S.shape[0],
+    amg_core.rs_cf_splitting(n,
                              S.indptr, S.indices,
                              T.indptr, T.indices,
                              influence,
                              splitting)
     if second_pass:
-        amg_core.rs_cf_splitting_pass2(S.shape[0], S.indptr,
+        amg_core.rs_cf_splitting_pass2(n, S.indptr,
                                        S.indices, splitting)
+
+    # RS is purely integer work (graph operations only)
+    # Graph: transpose(nnz) + pass1 over S and T(2*nnz) + lambda init(n)
+    #   + optional pass2(nnz) if second_pass=True
+    if work is not None:
+        work[1] += (4 * nnz_S + n) if second_pass else (3 * nnz_S + n)
 
     return splitting
 
 
-def PMIS(S):
+def PMIS(S, work=None):
     """C/F splitting using the Parallel Modified Independent Set method.
 
     Parameters
@@ -160,6 +170,8 @@ def PMIS(S):
     S : csr_array
         Strength of connection matrix indicating the strength between nodes i
         and j (S_ij)
+    work : list or None
+        If provided, a 2-element list [numerical_work, graph_work] to accumulate counts.
 
     Returns
     -------
@@ -184,17 +196,24 @@ def PMIS(S):
        SIAM Journal on Matrix Analysis and Applications 2006; 27:1019-1039.
 
     """
+    n = S.shape[0]
+    nnz_S = S.nnz
     S = remove_diagonal(S)
     weights, G, S, T = _preprocess(S)
     del S, T
 
-    splitting = MIS(G, weights)
+    # Count preprocessing work: transpose + G=S+T formation + row sums + random weights
+    if work is not None:
+        work[0] += n  # random weight augmentation (n float adds)
+        work[1] += 3 * nnz_S  # transpose(nnz) + G formation(2*nnz)
+
+    splitting = MIS(G, weights, work=work)
     _set_dirichlet(G, splitting)
 
     return splitting
 
 
-def PMISc(S, method='JP'):
+def PMISc(S, method='JP', work=None):
     """C/F splitting using Parallel Modified Independent Set (in color).
 
     PMIS-c, or PMIS in color, improves PMIS by perturbing the initial
@@ -210,6 +229,8 @@ def PMISc(S, method='JP'):
             * 'MIS' - Maximal Independent Set
             * 'JP'  - Jones-Plassmann (parallel)
             * 'LDF' - Largest-Degree-First (parallel)
+    work : list or None
+        If provided, a 2-element list [numerical_work, graph_work] to accumulate counts.
 
     Returns
     -------
@@ -234,13 +255,22 @@ def PMISc(S, method='JP'):
        Numerical Linear Algebra with Applications 2007; 14:611-643.
 
     """
+    n = S.shape[0]
+    nnz_S = S.nnz
     S = remove_diagonal(S)
     weights, G, S, T = _preprocess(S, coloring_method=method)
     del S, T
-    return MIS(G, weights)
+
+    # Count preprocessing work: transpose + G=S+T + row sums + coloring + random weights
+    if work is not None:
+        work[0] += n  # random weight augmentation (n float adds)
+        # Graph: transpose + G formation + coloring (estimate 3*nnz for greedy coloring)
+        work[1] += 3 * nnz_S + 3 * G.nnz
+
+    return MIS(G, weights, work=work)
 
 
-def CLJP(S, color=False):
+def CLJP(S, color=False, work=None):
     """Compute a C/F splitting using the parallel CLJP algorithm.
 
     Parameters
@@ -250,6 +280,8 @@ def CLJP(S, color=False):
         and j (S_ij)
     color : bool
         use the CLJP coloring approach
+    work : list or None
+        If provided, a 2-element list [numerical_work, graph_work] to accumulate counts.
 
     Returns
     -------
@@ -276,6 +308,8 @@ def CLJP(S, color=False):
     """
     if not issparse(S) or S.format != 'csr':
         raise TypeError('expected csr_array')
+    n = S.shape[0]
+    nnz_S = S.nnz
     S = remove_diagonal(S)
 
     colorid = 0
@@ -283,18 +317,23 @@ def CLJP(S, color=False):
         colorid = 1
 
     T = S.T.tocsr()  # transpose S for efficient column access
-    splitting = np.empty(S.shape[0], dtype='intc')
+    splitting = np.empty(n, dtype='intc')
 
-    amg_core.cljp_naive_splitting(S.shape[0],
+    amg_core.cljp_naive_splitting(n,
                                   S.indptr, S.indices,
                                   T.indptr, T.indices,
                                   splitting,
                                   colorid)
 
+    if work is not None:
+        # Graph work: 3-iteration estimate at 2*nnz per pass
+        # Accounts for: transpose construction + weight init + selection loops
+        work[1] += 6 * nnz_S
+
     return splitting
 
 
-def CLJPc(S):
+def CLJPc(S, work=None):
     """Compute a C/F splitting using the parallel CLJP-c algorithm.
 
     CLJP-c, or CLJP in color, improves CLJP by perturbing the initial
@@ -305,6 +344,8 @@ def CLJPc(S):
     S : csr_array
         Strength of connection matrix indicating the strength between nodes i
         and j (S_ij)
+    work : list or None
+        If provided, a 2-element list [numerical_work, graph_work] to accumulate counts.
 
     Returns
     -------
@@ -330,10 +371,10 @@ def CLJPc(S):
 
     """
     S = remove_diagonal(S)
-    return CLJP(S, color=True)
+    return CLJP(S, color=True, work=work)
 
 
-def MIS(G, weights, maxiter=None):
+def MIS(G, weights, maxiter=None, work=None):
     """Compute a maximal independent set of a graph in parallel.
 
     Parameters
@@ -344,6 +385,8 @@ def MIS(G, weights, maxiter=None):
         Array of weights for each vertex in the graph G
     maxiter : int
         Maximum number of iterations (default: None)
+    work : list or None
+        If provided, a 2-element list [numerical_work, graph_work] to accumulate counts.
 
     Returns
     -------
@@ -370,16 +413,21 @@ def MIS(G, weights, maxiter=None):
 
     mis = np.empty(G.shape[0], dtype='intc')
     mis[:] = -1
+    iters_out = np.empty(1, dtype='intc')
 
     fn = amg_core.maximal_independent_set_parallel
 
     if maxiter is None:
-        fn(G.shape[0], G.indptr, G.indices, -1, 1, 0, mis, weights, -1)
+        fn(G.shape[0], G.indptr, G.indices, -1, 1, 0, mis, weights, -1, iters_out)
     else:
         if maxiter < 0:
             raise ValueError('maxiter must be >= 0')
 
-        fn(G.shape[0], G.indptr, G.indices, -1, 1, 0, mis, weights, maxiter)
+        fn(G.shape[0], G.indptr, G.indices, -1, 1, 0, mis, weights, maxiter, iters_out)
+
+    if work is not None:
+        # Per iteration: IS selection (1x nnz) + conflict resolution (1x nnz) = 2 * nnz
+        work[1] += iters_out[0] * 2 * G.nnz
 
     return mis
 

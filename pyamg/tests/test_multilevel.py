@@ -107,31 +107,36 @@ class TestMultilevel(TestCase):
 
         # one level hierarchy
         mg = MultilevelSolver(levels[:1])
-        assert_equal(mg.cycle_complexity(cycle='V'), 100.0/100.0)  # 1
-        assert_equal(mg.cycle_complexity(cycle='W'), 100.0/100.0)  # 1
-        assert_equal(mg.cycle_complexity(cycle='AMLI'), 100.0/100.0)  # 1
-        assert_equal(mg.cycle_complexity(cycle='F'), 100.0/100.0)  # 1
+        assert_equal(mg.cycle_complexity(cycle='V'), 100.0/100.0)
+        assert_equal(mg.cycle_complexity(cycle='W'), 100.0/100.0)
+        assert_equal(mg.cycle_complexity(cycle='AMLI'), 100.0/100.0)
+        assert_equal(mg.cycle_complexity(cycle='F'), 100.0/100.0)
 
         # two level hierarchy
+        # Cost: smooth(2*100) + residual(100) + transfers(50+50) + coarse(25) = 425
         mg = MultilevelSolver(levels[:2])
-        assert_equal(mg.cycle_complexity(cycle='V'), 225.0/100.0)  # 2,1
-        assert_equal(mg.cycle_complexity(cycle='W'), 225.0/100.0)  # 2,1
-        assert_equal(mg.cycle_complexity(cycle='AMLI'), 225.0/100.0)  # 2,1
-        assert_equal(mg.cycle_complexity(cycle='F'), 225.0/100.0)  # 2,1
+        assert_equal(mg.cycle_complexity(cycle='V'), 425.0/100.0)
+        assert_equal(mg.cycle_complexity(cycle='W'), 425.0/100.0)
+        assert_equal(mg.cycle_complexity(cycle='AMLI'), 425.0/100.0)
+        assert_equal(mg.cycle_complexity(cycle='F'), 425.0/100.0)
 
         # three level hierarchy
+        # Level costs: L0=400, L1=105 (smooth 50 + res 25 + trans 30), coarse=9
+        # AMLI overhead at L1: 4*nnz(A1) + 11*n1 = 4*25 + 11*5 = 155
         mg = MultilevelSolver(levels[:3])
-        assert_equal(mg.cycle_complexity(cycle='V'), 259.0/100.0)  # 2,2,1
-        assert_equal(mg.cycle_complexity(cycle='W'), 318.0/100.0)  # 2,4,2
-        assert_equal(mg.cycle_complexity(cycle='AMLI'), 318.0/100.0)  # 2,4,2
-        assert_equal(mg.cycle_complexity(cycle='F'), 318.0/100.0)  # 2,4,2
+        assert_equal(mg.cycle_complexity(cycle='V'), 514.0/100.0)
+        assert_equal(mg.cycle_complexity(cycle='W'), 628.0/100.0)
+        assert_equal(mg.cycle_complexity(cycle='AMLI'), 783.0/100.0)
+        assert_equal(mg.cycle_complexity(cycle='F'), 628.0/100.0)
 
         # four level hierarchy
+        # Level costs: L0=400, L1=105, L2=39 (smooth 18 + res 9 + trans 12), coarse=4
+        # AMLI overhead at L2: 4*9+11*3=69, at L1: 4*25+11*5=155
         mg = MultilevelSolver(levels[:4])
-        assert_equal(mg.cycle_complexity(cycle='V'), 272.0/100.0)  # 2,2,2,1
-        assert_equal(mg.cycle_complexity(cycle='W'), 388.0/100.0)  # 2,4,8,4
-        assert_equal(mg.cycle_complexity(cycle='AMLI'), 388.0/100.0)  # 2,4,8,4
-        assert_equal(mg.cycle_complexity(cycle='F'), 366.0/100.0)  # 2,4,6,3
+        assert_equal(mg.cycle_complexity(cycle='V'), 548.0/100.0)
+        assert_equal(mg.cycle_complexity(cycle='W'), 782.0/100.0)
+        assert_equal(mg.cycle_complexity(cycle='AMLI'), 1075.0/100.0)
+        assert_equal(mg.cycle_complexity(cycle='F'), 739.0/100.0)  # 2,4,6,3
 
 
 class TestComplexMultilevel(TestCase):

@@ -6,7 +6,7 @@ from scipy.sparse import issparse, bsr_array
 from pyamg import amg_core
 
 
-def fit_candidates(AggOp, B, tol=1e-10):
+def fit_candidates(AggOp, B, tol=1e-10, work=None):
     """Fit near-nullspace candidates to form the tentative prolongator.
 
     Parameters
@@ -21,6 +21,8 @@ def fit_candidates(AggOp, B, tol=1e-10):
         Threshold for eliminating local basis functions.
         If after orthogonalization a local basis function Q[:, j] is small,
         i.e. ||Q[:, j]|| < tol, then Q[:, j] is set to zero.
+    work : list or None
+        If provided, a 2-element list [numerical_work, graph_work] to accumulate counts.
 
     Returns
     -------
@@ -148,5 +150,14 @@ def fit_candidates(AggOp, B, tol=1e-10):
                     AggOp_csc.indptr), shape=(K2*N_coarse, K1*N_fine))
     Q = Q.T.tobsr()
     R = R.reshape(-1, K2)
+
+    # Work: Modified Gram-Schmidt orthonormalization.
+    # Per vector bj: 2 norms (2*m*K1 FMAs) + bj orthogonalizations (2*m*K1 FMAs each)
+    #   + normalize (m*K1 muls). Total per vector: m*K1*(3 + 2*bj).
+    # Sum over K2: m*K1*K2*(K2 + 2).
+    # Graph: tocsc + Q.T.tobsr conversions.
+    if work is not None:
+        work[0] += AggOp.nnz * K1 * K2 * (K2 + 2)
+        work[1] += 2 * AggOp.nnz
 
     return Q, R

@@ -1116,7 +1116,7 @@ def coord_to_rbm(nnodes, ndof, x, y, z):
     return rbm
 
 
-def filter_operator(A, C, B, Bf, BtBinv=None):
+def filter_operator(A, C, B, Bf, BtBinv=None, work=None):
     """Filter the matrix A according to the matrix graph of C.
 
     Ensure that the new, filtered A satisfies:  A_new*B = Bf.
@@ -1135,6 +1135,8 @@ def filter_operator(A, C, B, Bf, BtBinv=None):
         to the neighborhood (with respect to the matrix graph
         of C) of dof of i.  If None is passed in, this array is
         computed internally.
+    work : list or None
+        If provided, a 2-element list [numerical_work, graph_work] to accumulate counts.
 
     Returns
     -------
@@ -1236,12 +1238,14 @@ def filter_operator(A, C, B, Bf, BtBinv=None):
     # inv(Bi'Bi), where Bi is B restricted to row i's sparsity pattern in
     # C. This array is used multiple times in satisfy_constraints(...).
     if BtBinv is None:
-        BtBinv = compute_BtBinv(B, C)
+        BtBinv = compute_BtBinv(B, C, work=work)
 
     # Filter A according to C's matrix graph
     C = C.copy()
     C.data[:] = 1
     A = A.multiply(C)
+    if work is not None:
+        work[1] += A.nnz  # graph ops for filtering
     # add explicit zeros to A wherever C is nonzero, but A is zero
     A = A.tocoo()
     C = C.tocoo()
@@ -1255,6 +1259,11 @@ def filter_operator(A, C, B, Bf, BtBinv=None):
 
     # Calculate difference between A @ B and Bf
     diff = A @ B - Bf
+    if work is not None:
+        # A @ B is sparse-dense matrix multiply: A.nnz * k FMAs
+        work[0] += A.nnz * NullDim
+        # subtraction: Nfine * k
+        work[0] += Nfine * NullDim
 
     # Right multiply each row i of A with
     # A_i <--- A_i - diff_i @ inv(B_i.T B_i) @ Bi.T
@@ -1267,6 +1276,10 @@ def filter_operator(A, C, B, Bf, BtBinv=None):
                                         np.ravel(diff),
                                         np.ravel(BtBinv), A.indptr,
                                         A.indices, np.ravel(A.data))
+    if work is not None:
+        # satisfy_constraints_helper: per row apply k x k matrix and update A entries
+        # Work is approximately Nnodes * k^2 for BtBinv application + A.nnz * k for updates
+        work[0] += Nnodes * NullDim * NullDim + A.nnz * NullDim
 
     A.eliminate_zeros()
     return A
@@ -1530,7 +1543,7 @@ def get_Cpt_params(A, Cnodes, AggOp, T):
     return {'P_I': P_I, 'I_F': I_F, 'I_C': I_C, 'Cpts': Cpts, 'Fpts': Fpts}
 
 
-def compute_BtBinv(B, C):
+def compute_BtBinv(B, C, work=None):
     """Create block inverses.
 
     Helper function that creates inv(B_i.T B_i) for each block row i in C,
@@ -1543,6 +1556,8 @@ def compute_BtBinv(B, C):
     C : {csr_array, bsr_array}
         Sparse NxM matrix, whose sparsity structure (i.e., matrix graph)
         is used to determine BtBinv.
+    work : list or None
+        If provided, a 2-element list [numerical_work, graph_work] to accumulate counts.
 
     Returns
     -------
@@ -1620,6 +1635,14 @@ def compute_BtBinv(B, C):
     #   amg_core.pinv_array(np.ravel(BtBinv), Nnodes, NullDim, 'F')
     BtBinv = BtBinv.transpose((0, 2, 1)).copy()
     linalg.pinv_array(BtBinv)
+
+    if work is not None:
+        # Bsq construction: k*(k+1)/2 muls per coarse dof
+        work[0] += Ncoarse * BsqCols
+        # calc_BtB: accumulate B^T B for each pattern row, ~nnz(C) * k ops
+        work[0] += C.nnz * NullDim
+        # pinv_array: k^3 inversion per block row
+        work[0] += Nnodes * NullDim * NullDim * NullDim
 
     return BtBinv
 
@@ -2102,7 +2125,7 @@ def filter_matrix_rows(A, theta, diagonal=False, lump=False):
     return A_filter
 
 
-def truncate_rows(A, nz_per_row):
+def truncate_rows(A, nz_per_row, work=None):
     """Truncate the rows of A by keeping only the largest in magnitude entries in each row.
 
     Parameters
@@ -2112,6 +2135,10 @@ def truncate_rows(A, nz_per_row):
 
     nz_per_row : int
         Determines how many entries in each row to keep
+
+    work : list, optional
+        If provided, work[1] (graph work) is incremented by the sort cost.
+        Sort cost: n*log2(n) for quicksort.
 
     Returns
     -------
@@ -2133,6 +2160,8 @@ def truncate_rows(A, nz_per_row):
            [ 0.  ,  0.  ,  1.  ,  0.5 ]])
 
     """
+    import numpy as np
+
     if not issparse(A):
         raise ValueError('Sparse matrix input needed')
     blocksize = 1
@@ -2143,6 +2172,15 @@ def truncate_rows(A, nz_per_row):
     Aformat = A.format
     A = A.tocsr()
     nz_per_row = int(nz_per_row)
+
+    # Count graph work for sorting (before the C++ call modifies the matrix)
+    # Each row with more than nz_per_row entries gets sorted via quicksort
+    # Sort cost: r_i * log2(r_i) per row for quicksort
+    if work is not None:
+        for i in range(A.shape[0]):
+            r_i = A.indptr[i + 1] - A.indptr[i]
+            if r_i > nz_per_row:
+                work[1] += int(r_i * np.log2(r_i)) if r_i > 1 else 0
 
     # Truncate rows of A, and then convert A back to original format
     amg_core.truncate_rows_csr(A.shape[0], nz_per_row, A.indptr,

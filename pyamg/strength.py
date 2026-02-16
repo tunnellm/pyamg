@@ -111,7 +111,7 @@ def distance_strength_of_connection(A, V, theta=2.0, relative_drop=True):
     return C
 
 
-def classical_strength_of_connection(A, theta=0.1, block=True, norm='abs'):
+def classical_strength_of_connection(A, theta=0.1, block=True, norm='abs', work=None):
     """Classical strength of connection measure.
 
     Return a strength of connection matrix using the classical AMG measure
@@ -242,10 +242,22 @@ def classical_strength_of_connection(A, theta=0.1, block=True, norm='abs'):
     if blocksize > 1 and not block:
         S = amalgamate(S, blocksize)
 
+    if work is not None:
+        nnz = len(data)  # input nnz (may differ from A.nnz for BSR)
+        # Classical SOC: pass 1 finds row max, pass 2 thresholds
+        # Pass 1: (nnz-n) abs + (nnz-n) max comparisons = 2*(nnz-n)
+        # Pass 2: nnz abs (threshold comparison is not a search, doesn't count)
+        # Total: 3*nnz - 2*n
+        work[0] += N  # numerical: theta * row_max per row
+        work[1] += 3 * nnz - 2 * N  # graph: abs + max-finding in pass 1, abs in pass 2
+        # scale_rows_by_largest_entry: find max per row, then scale
+        work[0] += N + S.nnz  # numerical: n divisions (1/max) + S.nnz multiplications
+        work[1] += 2 * S.nnz  # graph: find-max row scan (abs + max compare per entry)
+
     return S
 
 
-def symmetric_strength_of_connection(A, theta=0):
+def symmetric_strength_of_connection(A, theta=0, work=None):
     """Symmetric Strength Measure.
 
     Compute strength of connection matrix using the standard symmetric measure
@@ -340,9 +352,13 @@ def symmetric_strength_of_connection(A, theta=0):
             # Frobenius norms of the blocks
             data = (np.conjugate(A.data) * A.data).reshape(-1, R * C)
             data = np.sqrt(data.sum(axis=1))
+            if work is not None:
+                # Frobenius norm per block: R*C multiplies + R*C sums + 1 sqrt
+                num_blocks = len(A.indices)
+                work[0] += num_blocks * (2 * R * C + 1)
             A = sparse.csr_array((data, A.indices, A.indptr),
                                   shape=(int(M / R), int(N / C)))
-            return symmetric_strength_of_connection(A, theta)
+            return symmetric_strength_of_connection(A, theta, work=work)
     else:
         raise TypeError('expected CSR or BSR sparse format')
 
@@ -352,10 +368,22 @@ def symmetric_strength_of_connection(A, theta=0):
     # Scale S by the largest magnitude entry in each row
     S = scale_rows_by_largest_entry(S)
 
+    if work is not None:
+        n = A.shape[0]
+        nnz = A.nnz
+        # Symmetric SOC: |A[i,j]|^2 >= theta^2 * |A[i,i]| * |A[j,j]|
+        # Numerical: 2*nnz (squaring + threshold comparisons involve multiplies)
+        # Graph: 2*nnz + 2*n (two passes + mynorm abs operations + CSR construction)
+        work[0] += 2 * nnz
+        work[1] += 2 * nnz + 2 * n
+        # scale_rows_by_largest_entry: find max per row, then scale
+        work[0] += n + S.nnz  # numerical: n divisions (1/max) + S.nnz multiplications
+        work[1] += 2 * S.nnz  # graph: find-max row scan (abs + max compare per entry)
+
     return S
 
 
-def energy_based_strength_of_connection(A, theta=0.0, k=2):
+def energy_based_strength_of_connection(A, theta=0.0, k=2, work=None):
     """Energy Strength Measure.
 
     Compute a strength of connection matrix using an energy-based measure.
@@ -368,6 +396,9 @@ def energy_based_strength_of_connection(A, theta=0.0, k=2):
         Threshold parameter in [0,1].
     k : int
         Number of relaxation steps used to generate strength information.
+    work : list, optional
+        If provided, work[0] and work[1] are accumulated with numerical
+        and graph work counts respectively.
 
     Returns
     -------
@@ -413,6 +444,9 @@ def energy_based_strength_of_connection(A, theta=0.0, k=2):
     >>> S = energy_based_strength_of_connection(A, 0.0)
 
     """
+    if work is None:
+        work = [0, 0]
+
     if theta < 0:
         raise ValueError('expected a positive theta')
     if not sparse.issparse(A):
@@ -431,34 +465,61 @@ def energy_based_strength_of_connection(A, theta=0.0, k=2):
         bsr_flag = False
         numPDEs = 1
 
+    n = A.shape[0]
+    nnz_A = A.nnz
+
     # Convert A to csc and Atilde to csr
     if A.format == 'csr':
         Atilde = A.copy()
         A = A.tocsc()
+        work[1] += nnz_A  # graph: tocsc
     else:
         A = A.tocsc()
         Atilde = A.copy()
         Atilde = Atilde.tocsr()
+        work[1] += 2 * nnz_A  # graph: tocsc + tocsr
 
     # Calculate the weighted-Jacobi parameter
     D = A.diagonal()
+    work[1] += nnz_A / 2  # graph: diagonal extraction (avg half-row CSR scan)
     Dinv = 1.0 / D
+    work[0] += n  # numerical: n divisions
     Dinv[D == 0] = 0.0
     Dinv = sparse.csc_array((Dinv, (np.arange(A.shape[0], dtype=A.indptr.dtype),
                                     np.arange(A.shape[1], dtype=A.indptr.dtype))),
                             shape=A.shape)
     DinvA = Dinv @ A
-    omega = 1.0 / approximate_spectral_radius(DinvA)
+    work[0] += nnz_A  # numerical: diagonal scaling
+    omega = 1.0 / approximate_spectral_radius(DinvA, work=work)
     del DinvA
 
     # Approximate A-inverse with k steps of w-Jacobi and a zero initial guess
     S = sparse.csc_array(A.shape, dtype=A.dtype)  # empty matrix
     Id = sparse.eye_array(A.shape[0], A.shape[1], format='csc')
     for _i in range(k + 1):
+        # S = S + omega * (Dinv @ (Id - A @ S))
+        nnz_S = S.nnz
+        if nnz_S == 0:
+            # First iteration: A @ S = 0, result is omega * Dinv (n entries)
+            work[0] += n  # numerical: omega * diagonal
+        else:
+            # SpMM: A @ S where S has nnz_S entries
+            spmm_cost = nnz_A * nnz_S // n
+            work[0] += spmm_cost  # numerical
+            work[1] += spmm_cost  # graph
+            # Sparse ops: subtract + diag_scale + scalar_mul + add
+            work[0] += 4 * nnz_S
         S = S + omega * (Dinv @ (Id - A @ S))
 
     # Calculate the strength entries in S column-wise, but only strength
     # values at the sparsity pattern of A
+    # Outer loop: n iterations with SpMV (nnz_A) + inner product (2n) + sqrt
+    # Inner loop: nnz_Atilde total with SpMV (nnz_A) + inner (2n) + sqrt + div + sub
+    nnz_Atilde = Atilde.nnz
+    work[0] += n * (nnz_A + 2 * n + 1)  # outer loop
+    work[0] += nnz_Atilde * (nnz_A + 2 * n + 3)  # inner loop
+    work[1] += nnz_Atilde  # graph: comparisons + abs
+
     for i in range(Atilde.shape[0]):
         v = S[:, [i]].toarray()
         v = v.ravel()
@@ -480,25 +541,29 @@ def energy_based_strength_of_connection(A, theta=0.0, k=2):
 
             v[col] = vj
 
-    # Apply drop tolerance
-    Atilde = classical_strength_of_connection(Atilde, theta=theta)
+    # Apply drop tolerance (classical_strength_of_connection)
+    Atilde = classical_strength_of_connection(Atilde, theta=theta, work=work)
     Atilde.eliminate_zeros()
 
     # Put ones on the diagonal
     Atilde = Atilde + Id.tocsr()
+    work[0] += n  # numerical: sparse addition with identity
     Atilde.sort_indices()
 
     # Amalgamate Atilde for the BSR case, using ones for all strong connections
     if bsr_flag:
         Atilde = Atilde.tobsr(blocksize=(numPDEs, numPDEs))
+        work[1] += Atilde.nnz  # graph: tobsr
         nblocks = Atilde.indices.shape[0]
         uone = np.ones((nblocks,))
         Atilde = sparse.csr_array((uone, Atilde.indices, Atilde.indptr),
                                    shape=(int(Atilde.shape[0] / numPDEs),
                                           int(Atilde.shape[1] / numPDEs)))
 
-    # Scale C by the largest magnitude entry in each row
+    # Scale by largest entry per row
     Atilde = scale_rows_by_largest_entry(Atilde)
+    work[0] += Atilde.nnz  # numerical: divisions
+    work[1] += Atilde.nnz  # graph: abs for max
 
     return Atilde
 
@@ -514,7 +579,7 @@ def ode_strength_of_connection(A, B=None, epsilon=4.0, k=2, proj_type='l2',
 
 def evolution_strength_of_connection(A, B=None, epsilon=4.0, k=2,
                                      proj_type='l2', block_flag=False,
-                                     symmetrize_measure=True):
+                                     symmetrize_measure=True, work=None):
     """Evolution strength measure.
 
     Construct strength of connection matrix using an Evolution-based measure.
@@ -615,6 +680,11 @@ def evolution_strength_of_connection(A, B=None, epsilon=4.0, k=2,
         Dinv[mask] = 1.0 / D[mask]
         Dinv[D == 0] = 1.0
         Dinv_A = scale_rows(A, Dinv, copy=True)
+        # Work: diagonal extraction (nnz/2 avg search) + n inversions + nnz scale
+        if work is not None:
+            n = A.shape[0]
+            work[0] += n + A.nnz  # numerical: inversions + scale_rows
+            work[1] += A.nnz // 2  # graph: diagonal extraction
 
     A.eliminate_zeros()
     A.sort_indices()
@@ -625,7 +695,7 @@ def evolution_strength_of_connection(A, B=None, epsilon=4.0, k=2,
 
     # Get spectral radius of Dinv@A, this will be used to scale the time step
     # size for the ODE
-    rho_DinvA = approximate_spectral_radius(Dinv_A)
+    rho_DinvA = approximate_spectral_radius(Dinv_A, work=work)
 
     # Calculate D_A for later use in the minimization problem
     if proj_type == 'D_A':
@@ -645,6 +715,10 @@ def evolution_strength_of_connection(A, B=None, epsilon=4.0, k=2,
     Id = sparse.eye_array(dimen, format='csr', dtype=A.dtype)
     Atilde = Id - (1.0 / rho_DinvA) * Dinv_A
     Atilde = Atilde.T.tocsr()
+    # Work: nnz scaling + n diagonal subtractions + nnz negations + nnz transpose
+    if work is not None:
+        work[0] += Dinv_A.nnz + dimen  # numerical: scaling + diagonal subtract
+        work[1] += 2 * Dinv_A.nnz  # graph: negations + transpose
 
     # Construct a sparsity mask for Atilde that will restrict Atilde^T to the
     # nonzero pattern of A, with the added constraint that row i of Atilde^T
@@ -669,10 +743,20 @@ def evolution_strength_of_connection(A, B=None, epsilon=4.0, k=2,
 
         # Calculate (Atilde^nsquare)^T = (Atilde^T)^nsquare
         for _i in range(nsquare):
+            # Work: SpMM cost = nnz(A) * nnz(B) / n
+            if work is not None:
+                spmm_cost = Atilde.nnz * Atilde.nnz // dimen
+                work[0] += spmm_cost
+                work[1] += spmm_cost
             Atilde = Atilde @ Atilde
 
         JacobiStep = (Id - (1.0 / rho_DinvA) @ Dinv_A).T.tocsr()
         for _i in range(ninc):
+            # Work: SpMM cost
+            if work is not None:
+                spmm_cost = Atilde.nnz * JacobiStep.nnz // dimen
+                work[0] += spmm_cost
+                work[1] += spmm_cost
             Atilde = Atilde @ JacobiStep
         del JacobiStep
 
@@ -696,6 +780,11 @@ def evolution_strength_of_connection(A, B=None, epsilon=4.0, k=2,
         # Use computational short-cut for case (ninc == 0) and (nsquare > 0)
         # Calculate Atilde^k only at the sparsity pattern of mask.
         for _i in range(nsquare - 1):
+            # Work: SpMM cost
+            if work is not None:
+                spmm_cost = Atilde.nnz * Atilde.nnz // dimen
+                work[0] += spmm_cost
+                work[1] += spmm_cost
             Atilde = Atilde @ Atilde
 
         # Call incomplete mat-mat mult
@@ -708,6 +797,11 @@ def evolution_strength_of_connection(A, B=None, epsilon=4.0, k=2,
                                          AtildeCSC.indices, AtildeCSC.data,
                                          mask.indptr, mask.indices, mask.data,
                                          dimen)
+        # Work: incomplete SpMM at mask pattern + tocsc conversion
+        if work is not None:
+            incomplete_cost = mask.nnz * Atilde.nnz // dimen
+            work[0] += incomplete_cost
+            work[1] += incomplete_cost + Atilde.nnz  # +nnz for tocsc
 
         del AtildeCSC, Atilde
         Atilde = mask
@@ -746,7 +840,11 @@ def evolution_strength_of_connection(A, B=None, epsilon=4.0, k=2,
         Bmat_forscaling = np.ravel(Bmat)
         Bmat_forscaling[Bmat_forscaling == 0] = 1.0
         DAtilde = Atilde.diagonal()
+        if work is not None:
+            work[1] += Atilde.nnz // 2  # graph: diagonal extraction
         DAtildeDivB = np.ravel(DAtilde) / Bmat_forscaling
+        if work is not None:
+            work[0] += dimen  # numerical: n divisions
 
         # Calculate best approximation, z_tilde, in span(B)
         #   Importantly, scale_rows and scale_columns leave zero entries
@@ -755,24 +853,42 @@ def evolution_strength_of_connection(A, B=None, epsilon=4.0, k=2,
         data = Atilde.data.copy()
         Atilde.data[:] = 1.0
         Atilde = scale_rows(Atilde, DAtildeDivB)
+        if work is not None:
+            work[0] += Atilde.nnz  # numerical: nnz multiplications
         Atilde = scale_columns(Atilde, np.ravel(Bmat_forscaling))
+        if work is not None:
+            work[0] += Atilde.nnz  # numerical: nnz multiplications
 
         # If angle in the complex plane between z and z_tilde is
         # greater than 90 degrees, then weak.  We can just look at the
         # dot product to determine if angle is greater than 90 degrees.
         angle = np.multiply(np.real(Atilde.data), np.real(data)) +\
             np.multiply(np.imag(Atilde.data), np.imag(data))
+        if work is not None:
+            # Complex: 2 muls + 1 add per entry; real: 1 mul per entry
+            nnz = len(Atilde.data)
+            if np.issubdtype(Atilde.dtype, np.complexfloating):
+                work[0] += 3 * nnz
+            else:
+                work[0] += nnz
         angle = angle < 0.0
         angle = np.array(angle, dtype=bool)
 
         # Calculate Approximation ratio
         Atilde.data = Atilde.data / data
+        if work is not None:
+            work[0] += len(Atilde.data)  # numerical: nnz divisions
 
         # If approximation ratio is less than tol, then weak connection
         weak_ratio = np.abs(Atilde.data) < 1e-4
+        if work is not None:
+            work[1] += len(Atilde.data)  # graph: nnz abs
 
         # Calculate Approximation error
         Atilde.data = abs(1.0 - Atilde.data)
+        if work is not None:
+            work[0] += len(Atilde.data)  # numerical: nnz subtractions
+            work[1] += len(Atilde.data)  # graph: nnz abs
 
         # Set small ratios and large angles to weak
         Atilde.data[weak_ratio] = 0.0
@@ -797,19 +913,30 @@ def evolution_strength_of_connection(A, B=None, epsilon=4.0, k=2,
                 BDB[:, counter] = 2.0 *\
                     (np.conjugate(np.ravel(Bmat[:, i])) * np.ravel(D_A @ Bmat[:, j]))
                 counter = counter + 1
+        if work is not None:
+            # Per iteration: D_A@B (n muls) + elementwise mul (n) + scale (n) = 3n
+            work[0] += 3 * dimen * BDBCols
 
         # Choose tolerance for dropping "numerically zero" values later
         tol = set_tol(Atilde.dtype)
 
         # Use constrained min problem to define strength
+        DB_conj = np.ravel((D_A @ B.conj()).T)
+        if work is not None:
+            work[0] += dimen * NullDim  # numerical: diagonal SpMV per column
+
         amg_core.evolution_strength_helper(Atilde.data,
                                            Atilde.indptr,
                                            Atilde.indices,
                                            Atilde.shape[0],
                                            np.ravel(Bmat),
-                                           np.ravel((D_A @ B.conj()).T),
+                                           DB_conj,
                                            np.ravel(BDB),
                                            BDBCols, NullDim, tol)
+        if work is not None:
+            # Per row: LHS build O(length * NullDim^2) + SVD O(NullDim^3)
+            work[0] += Atilde.nnz * NullDim * NullDim + dimen * NullDim * NullDim * NullDim
+            work[1] += dimen  # graph: row traversals
 
         Atilde.eliminate_zeros()
 
@@ -821,16 +948,27 @@ def evolution_strength_of_connection(A, B=None, epsilon=4.0, k=2,
     if epsilon != np.inf:
         amg_core.apply_distance_filter(dimen, epsilon, Atilde.indptr,
                                        Atilde.indices, Atilde.data)
+        if work is not None:
+            # Pass 1: find min per row, Pass 2: apply threshold
+            work[0] += dimen  # numerical: threshold = epsilon * min
+            work[1] += 2 * Atilde.nnz  # graph: two passes over entries
         Atilde.eliminate_zeros()
 
     # Symmetrize
     if symmetrize_measure:
         Atilde = 0.5 * (Atilde + Atilde.T)
+        if work is not None:
+            # Counting nnz each; additional Python overhead (add + scale) not counted
+            work[0] += Atilde.nnz  # numerical
+            work[1] += Atilde.nnz  # graph: transpose
 
     # Set diagonal to 1.0, as each point is strongly connected to itself.
     Id = sparse.eye_array(dimen, format='csr')
     Id.data -= Atilde.diagonal()
     Atilde = Atilde + Id
+    if work is not None:
+        work[0] += 2 * dimen  # numerical: subtract + add
+        work[1] += Atilde.nnz // 2  # graph: diagonal extraction
 
     # If converted BSR to CSR, convert back and return amalgamated matrix,
     #   i.e. the sparsity structure of the blocks of Atilde
@@ -850,14 +988,20 @@ def evolution_strength_of_connection(A, B=None, epsilon=4.0, k=2,
     # Standardized strength values require small values be weak and large
     # values be strong.  So, we invert the algebraic distances computed here
     Atilde.data = 1.0 / Atilde.data
+    if work is not None:
+        work[0] += Atilde.nnz  # numerical: nnz divisions
 
     # Scale C by the largest magnitude entry in each row
     Atilde = scale_rows_by_largest_entry(Atilde)
+    if work is not None:
+        # scale_rows_by_largest_entry: find max per row, then scale
+        work[0] += dimen + Atilde.nnz  # numerical: n divisions (1/max) + nnz multiplications
+        work[1] += 2 * Atilde.nnz  # graph: find-max row scan (abs + max compare per entry)
 
     return Atilde
 
 
-def relaxation_vectors(A, R, k, alpha):
+def relaxation_vectors(A, R, k, alpha, work=None):
     """Generate test vectors by relaxing on Ax=0 for some random vectors x.
 
     Parameters
@@ -870,6 +1014,9 @@ def relaxation_vectors(A, R, k, alpha):
         Number of relaxation passes.
     alpha : scalar
         Weight for Jacobi.
+    work : list, optional
+        If provided, work[0] and work[1] are accumulated with numerical
+        and graph work counts respectively.
 
     Returns
     -------
@@ -877,6 +1024,9 @@ def relaxation_vectors(A, R, k, alpha):
         Dense array N x k array of relaxation vectors.
 
     """
+    if work is None:
+        work = [0, 0]
+
     # random n x R block in column ordering
     n = A.shape[0]
     x = np.random.rand(n * R) - 0.5
@@ -885,6 +1035,9 @@ def relaxation_vectors(A, R, k, alpha):
     #     x[:,i] = x[:,i] - np.mean(x[:,i])
     b = np.zeros((n, 1))
 
+    # R vectors, k jacobi iterations each, nnz work per iteration
+    work[0] += R * k * A.nnz  # numerical: SpMV per iteration
+
     for r in range(0, R):
         jacobi(A, x[:, r], b, iterations=k, omega=alpha)
         # x[:,r] = x[:,r]/norm(x[:,r])
@@ -892,7 +1045,7 @@ def relaxation_vectors(A, R, k, alpha):
     return x
 
 
-def affinity_distance(A, alpha=0.5, R=5, k=20, epsilon=4.0):
+def affinity_distance(A, alpha=0.5, R=5, k=20, epsilon=4.0, work=None):
     """Affinity Distance Strength Measure.
 
     Parameters
@@ -907,6 +1060,9 @@ def affinity_distance(A, alpha=0.5, R=5, k=20, epsilon=4.0):
         Number of relaxation passes.
     epsilon : scalar
         Drop tolerance.
+    work : list, optional
+        If provided, work[0] and work[1] are accumulated with numerical
+        and graph work counts respectively.
 
     Returns
     -------
@@ -927,6 +1083,9 @@ def affinity_distance(A, alpha=0.5, R=5, k=20, epsilon=4.0):
         (LAMG): Fast Graph Laplacian Linear Solver"
 
     """
+    if work is None:
+        work = [0, 0]
+
     if not sparse.issparse(A) or A.format != 'csr':
         A = sparse.csr_array(A)
 
@@ -947,10 +1106,10 @@ def affinity_distance(A, alpha=0.5, R=5, k=20, epsilon=4.0):
         return 1 - np.sum(x[rows] * x[cols], axis=1)**2 / \
             (np.sum(x[rows]**2, axis=1) * np.sum(x[cols]**2, axis=1))
 
-    return distance_measure_common(A, distance, alpha, R, k, epsilon)
+    return distance_measure_common(A, distance, alpha, R, k, epsilon, work)
 
 
-def algebraic_distance(A, alpha=0.5, R=5, k=20, epsilon=2.0, p=2):
+def algebraic_distance(A, alpha=0.5, R=5, k=20, epsilon=2.0, p=2, work=None):
     """Algebraic Distance Strength Measure.
 
     Parameters
@@ -967,6 +1126,9 @@ def algebraic_distance(A, alpha=0.5, R=5, k=20, epsilon=2.0, p=2):
         Drop tolerance.
     p : scalar or inf
         The `p`-norm of the measure.
+    work : list, optional
+        If provided, work[0] and work[1] are accumulated with numerical
+        and graph work counts respectively.
 
     Returns
     -------
@@ -987,6 +1149,9 @@ def algebraic_distance(A, alpha=0.5, R=5, k=20, epsilon=2.0, p=2):
         "Advanced Coarsening Schemes for Graph Partitioning"
 
     """
+    if work is None:
+        work = [0, 0]
+
     if not sparse.issparse(A) or A.format != 'csr':
         A = sparse.csr_array(A)
 
@@ -1013,10 +1178,10 @@ def algebraic_distance(A, alpha=0.5, R=5, k=20, epsilon=2.0, p=2):
 
         return np.abs(x[rows] - x[cols]).max(axis=1)
 
-    return distance_measure_common(A, distance, alpha, R, k, epsilon)
+    return distance_measure_common(A, distance, alpha, R, k, epsilon, work)
 
 
-def distance_measure_common(A, func, alpha, R, k, epsilon):
+def distance_measure_common(A, func, alpha, R, k, epsilon, work=None):
     """Strength of connection matrix from a function applied to relaxation vectors.
 
     Parameters
@@ -1033,6 +1198,9 @@ def distance_measure_common(A, func, alpha, R, k, epsilon):
         Number of relaxation passes.
     epsilon : scalar
         Filter tolerance.
+    work : list, optional
+        If provided, work[0] and work[1] are accumulated with numerical
+        and graph work counts respectively.
 
     Returns
     -------
@@ -1040,33 +1208,50 @@ def distance_measure_common(A, func, alpha, R, k, epsilon):
         Test vectors.
 
     """
-    # create test vectors
-    x = relaxation_vectors(A, R, k, alpha)
+    if work is None:
+        work = [0, 0]
+
+    n = A.shape[0]
+    nnz = A.nnz
+
+    # create test vectors (R * k jacobi iterations)
+    x = relaxation_vectors(A, R, k, alpha, work)
 
     # apply distance measure function to vectors
+    # Distance functions operate on nnz pairs with ~8 ops per pair
+    # (indexing, multiply, sum, power, divide)
+    work[0] += 8 * nnz  # numerical: element-wise operations
+    work[1] += nnz  # graph: A.nonzero() call inside distance function
     d = func(x)
 
     # drop distances to self
+    work[1] += nnz  # graph: A.nonzero()
     (rows, cols) = A.nonzero()
     weak = np.where(rows == cols)[0]
     d[weak] = 0
+    work[1] += nnz  # graph: csr_array construction
     C = sparse.csr_array((d, (rows, cols)), shape=A.shape)
     C.eliminate_zeros()
 
     # remove weak connections
     # removes entry e from a row if e > theta * min of all entries in the row
+    work[1] += 2 * C.nnz  # graph: filter traversal + comparisons
     amg_core.apply_distance_filter(C.shape[0], epsilon, C.indptr,
                                    C.indices, C.data)
     C.eliminate_zeros()
 
     # Standardized strength values require small values be weak and large
     # values be strong.  So, we invert the distances.
+    work[0] += C.nnz  # numerical: divisions
     C.data = 1.0 / C.data
 
     # Put an identity on the diagonal
+    work[0] += n  # numerical: sparse addition with identity
     C = C + sparse.eye_array(C.shape[0], C.shape[1], format='csr')
 
     # Scale C by the largest magnitude entry in each row
+    work[0] += C.nnz  # numerical: divisions
+    work[1] += C.nnz  # graph: abs for max
     C = scale_rows_by_largest_entry(C)
 
     return C

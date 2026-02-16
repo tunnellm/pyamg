@@ -40,6 +40,8 @@ def _CRsweep(A, B, Findex, Cindex, nu, thetacr, method):
         Convergence factor of last iteration
     e : array like
         Smoothed error vector
+    num_iters : int
+        Number of GS iterations performed
 
     """
     n = A.shape[0]    # problem size
@@ -75,11 +77,11 @@ def _CRsweep(A, B, Findex, Cindex, nu, thetacr, method):
         if ((abs(rhok - rhok_old) / rhok) < 0.1) and (it >= nu):
             break
 
-    return rhok, e
+    return rhok, e, it
 
 
 def CR(A, method='habituated', B=None, nu=3, thetacr=0.7,
-        thetacs='auto', maxiter=20, verbose=False):
+        thetacs='auto', maxiter=20, verbose=False, work=None):
     """Use Compatible Relaxation to compute a C/F splitting.
 
     Parameters
@@ -112,6 +114,8 @@ def CR(A, method='habituated', B=None, nu=3, thetacr=0.7,
     verbose : bool
         If true, print iteration number, convergence factor and
         coarsening factor after each iteration.
+    work : list or None
+        If provided, a 2-element list [numerical_work, graph_work] to accumulate counts.
 
     Returns
     -------
@@ -133,6 +137,9 @@ def CR(A, method='habituated', B=None, nu=3, thetacr=0.7,
 
     """
     n = A.shape[0]    # problem size
+
+    if work is not None and len(work) < 2:
+        raise ValueError('work must be a list with at least 2 elements')
 
     if thetacs == 'auto':
         pass
@@ -174,7 +181,11 @@ def CR(A, method='habituated', B=None, nu=3, thetacr=0.7,
     gamma = np.zeros((n,))
 
     # 3.1b - Run initial smoothing sweep
-    rho, e = _CRsweep(A, B, Findex, Cindex, nu, thetacr, method=method)
+    rho, e, gs_iters = _CRsweep(A, B, Findex, Cindex, nu, thetacr, method=method)
+
+    # Count work: each GS iteration is nnz(A) numerical work
+    if work is not None:
+        work[0] += gs_iters * A.nnz
 
     # 3.1c - Loop until desired convergence or maximum iterations reached
     for it in range(0, maxiter):
@@ -203,8 +214,19 @@ def CR(A, method='habituated', B=None, nu=3, thetacr=0.7,
         Findex = indices[1:(num_F+1)]
         Cindex = indices[(num_F+1):]
 
+        # Count cr_helper work (formula-based estimate)
+        # numerical: 2*num_F (normalization + gamma divisions)
+        # graph: num_F (abs in normalization) + 2*nnz (weight computation + MIS traversals)
+        if work is not None:
+            work[0] += 2 * num_F
+            work[1] += num_F + 2 * A.nnz
+
         # 3.1g - Call CR smoothing iteration
-        rho, e = _CRsweep(A, B, Findex, Cindex, nu, thetacr, method=method)
+        rho, e, gs_iters = _CRsweep(A, B, Findex, Cindex, nu, thetacr, method=method)
+
+        # Count work: each GS iteration is nnz(A) numerical work
+        if work is not None:
+            work[0] += gs_iters * A.nnz
 
         # Print details on current iteration
         if verbose:

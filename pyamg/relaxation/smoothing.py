@@ -72,7 +72,7 @@ def _extract_splitting(lvl):
     return Fpts, Cpts
 
 
-def change_smoothers(ml, presmoother, postsmoother):
+def change_smoothers(ml, presmoother, postsmoother, work=None):
     """Initialize pre and post smoothers.
 
     Initialize pre- and post- smoothers throughout a MultilevelSolver, with
@@ -193,6 +193,18 @@ def change_smoothers(ml, presmoother, postsmoother):
         raise ValueError('Unrecognized postsmoother -- use a string:\n '
                          '"method" or ("method", opts) or list thereof.')
 
+    # Functions that accept work parameter for spectral radius counting
+    work_funcs = {'jacobi', 'block_jacobi', 'richardson', 'chebyshev',
+                  'jacobi_ne', 'schwarz', 'strength_based_schwarz',
+                  'cf_jacobi', 'fc_jacobi'}
+
+    def _add_work(fn, kwargs):
+        """Inject work into kwargs for functions that accept it."""
+        if work is not None and fn in work_funcs:
+            kwargs = kwargs.copy()
+            kwargs['work'] = work
+        return kwargs
+
     # set ml.levels[i].presmoother = presmoother[i],
     #     ml.levels[i].postsmoother = postsmoother[i]
     fn1 = None      # Predefine to keep scope beyond first loop
@@ -207,14 +219,14 @@ def change_smoothers(ml, presmoother, postsmoother):
         # get function handle
         setup_presmoother = _setup_call(fn1)
 
-        ml.levels[i].presmoother = setup_presmoother(ml.levels[i], **kwargs1)
+        ml.levels[i].presmoother = setup_presmoother(ml.levels[i], **_add_work(fn1, kwargs1))
 
         # unpack postsmoother[i]
         fn2, kwargs2 = _unpack_arg(postsmoother[i])
         # get function handle
         setup_postsmoother = _setup_call(fn2)
 
-        ml.levels[i].postsmoother = setup_postsmoother(ml.levels[i], **kwargs2)
+        ml.levels[i].postsmoother = setup_postsmoother(ml.levels[i], **_add_work(fn2, kwargs2))
 
         # Check if symmetric smoothing scheme
         if 'iterations' in kwargs1:
@@ -260,14 +272,14 @@ def change_smoothers(ml, presmoother, postsmoother):
         mid_len = min(len(postsmoother), len(ml.levels[:-1]))
         for i in range(min_len, mid_len):
             # Set up presmoother
-            ml.levels[i].presmoother = setup_presmoother(ml.levels[i], **kwargs1)
+            ml.levels[i].presmoother = setup_presmoother(ml.levels[i], **_add_work(fn1, kwargs1))
 
             # unpack postsmoother[i]
             fn2, kwargs2 = _unpack_arg(postsmoother[i])
             # get function handle
             setup_postsmoother = _setup_call(fn2)
 
-            ml.levels[i].postsmoother = setup_postsmoother(ml.levels[i], **kwargs2)
+            ml.levels[i].postsmoother = setup_postsmoother(ml.levels[i], **_add_work(fn2, kwargs2))
 
             # Check if symmetric smoothing scheme
             if 'iterations' in kwargs1:
@@ -316,10 +328,10 @@ def change_smoothers(ml, presmoother, postsmoother):
             # get function handle
             setup_presmoother = _setup_call(fn1)
 
-            ml.levels[i].presmoother = setup_presmoother(ml.levels[i], **kwargs1)
+            ml.levels[i].presmoother = setup_presmoother(ml.levels[i], **_add_work(fn1, kwargs1))
 
             # Set up postsmoother
-            ml.levels[i].postsmoother = setup_postsmoother(ml.levels[i], **kwargs2)
+            ml.levels[i].postsmoother = setup_postsmoother(ml.levels[i], **_add_work(fn2, kwargs2))
 
             # Check if symmetric smoothing scheme
             if 'iterations' in kwargs1:
@@ -365,17 +377,19 @@ def change_smoothers(ml, presmoother, postsmoother):
 
     # Fill in remaining levels
     for i in range(mid_len, len(ml.levels[:-1])):
-        ml.levels[i].presmoother = setup_presmoother(ml.levels[i], **kwargs1)
-        ml.levels[i].postsmoother = setup_postsmoother(ml.levels[i], **kwargs2)
+        ml.levels[i].presmoother = setup_presmoother(ml.levels[i], **_add_work(fn1, kwargs1))
+        ml.levels[i].postsmoother = setup_postsmoother(ml.levels[i], **_add_work(fn2, kwargs2))
 
 
-def rho_D_inv_A(A):
+def rho_D_inv_A(A, work=None):
     """Return the (approx.) spectral radius of D^-1 @ A.
 
     Parameters
     ----------
     A : sparse matrix
         Target matrix for computing the spectral radius
+    work : list or None
+        If provided, a 2-element list [numerical_work, graph_work] to accumulate counts.
 
     Returns
     -------
@@ -395,12 +409,17 @@ def rho_D_inv_A(A):
     if not hasattr(A, 'rho_D_inv'):
         D_inv = get_diagonal(A, inv=True)
         D_inv_A = scale_rows(A, D_inv, copy=True)
-        A.rho_D_inv = approximate_spectral_radius(D_inv_A)
+        A.rho_D_inv = approximate_spectral_radius(D_inv_A, work=work)
+        A.rho_D_inv_matvecs = getattr(D_inv_A, 'rho_matvecs', 0)
+        # Work: get_diagonal (nnz/2 search) + scale_rows (nnz muls)
+        if work is not None:
+            work[0] += A.nnz  # scale_rows numerical
+            work[1] += A.nnz // 2  # diagonal extraction graph
 
     return A.rho_D_inv
 
 
-def rho_block_D_inv_A(A, Dinv):
+def rho_block_D_inv_A(A, Dinv, work=None):
     """Return the (approx.) spectral radius of block D^-1 @ A.
 
     Parameters
@@ -410,6 +429,8 @@ def rho_block_D_inv_A(A, Dinv):
     Dinv : array
         Inverse of diagonal blocks of A
         size (N/blocksize, blocksize, blocksize)
+    work : list or None
+        If provided, a 2-element list [numerical_work, graph_work] to accumulate counts.
 
     Returns
     -------
@@ -433,17 +454,26 @@ def rho_block_D_inv_A(A, Dinv):
         if Dinv.shape[0] != int(A.shape[0]/blocksize):
             raise ValueError('Dinv and A have incompatible dimensions')
 
-        Dinv = sparse.bsr_array((Dinv,
-                                 np.arange(Dinv.shape[0], dtype=np.int32),
-                                 np.arange(Dinv.shape[0] + 1, dtype=np.int32)),
-                                shape=A.shape)
+        Dinv_bsr = sparse.bsr_array((Dinv,
+                                     np.arange(Dinv.shape[0], dtype=np.int32),
+                                     np.arange(Dinv.shape[0] + 1, dtype=np.int32)),
+                                    shape=A.shape)
 
         # Don't explicitly form Dinv @ A
+        matvec_count = [0]
+
         def matvec(x):
-            return Dinv @ (A @ x)
+            matvec_count[0] += 1
+            return Dinv_bsr @ (A @ x)
         D_inv_A = LinearOperator(A.shape, matvec, dtype=A.dtype)
 
         A.rho_block_D_inv = approximate_spectral_radius(D_inv_A)
+        A.rho_block_D_inv_matvecs = matvec_count[0]
+
+        # Work: each matvec is A @ x (nnz) + Dinv @ y (n * blocksize^2)
+        if work is not None:
+            cost_per_matvec = A.nnz + A.shape[0] * blocksize * blocksize
+            work[0] += matvec_count[0] * cost_per_matvec
 
     return A.rho_block_D_inv
 
@@ -498,10 +528,10 @@ def setup_gauss_seidel(lvl, iterations=DEFAULT_NITER, sweep=DEFAULT_SWEEP):
     return smoother
 
 
-def setup_jacobi(lvl, iterations=DEFAULT_NITER, omega=1.0, withrho=True):
+def setup_jacobi(lvl, iterations=DEFAULT_NITER, omega=1.0, withrho=True, work=None):
     """Set up weighted-Jacobi."""
     if withrho:
-        omega = omega/rho_D_inv_A(lvl.A)
+        omega = omega/rho_D_inv_A(lvl.A, work=work)
 
     smoother = partial(relaxation.jacobi, iterations=iterations, omega=omega)
     update_wrapper(smoother, relaxation.jacobi)  # set __name__
@@ -510,13 +540,21 @@ def setup_jacobi(lvl, iterations=DEFAULT_NITER, omega=1.0, withrho=True):
 
 def setup_schwarz(lvl, iterations=DEFAULT_NITER, subdomain=None,
                   subdomain_ptr=None, inv_subblock=None, inv_subblock_ptr=None,
-                  sweep=DEFAULT_SWEEP):
+                  sweep=DEFAULT_SWEEP, work=None):
     """Set up Schwarz."""
     matrix_asformat(lvl, 'A', 'csr')
     lvl.Acsr.sort_indices()
     subdomain, subdomain_ptr, inv_subblock, inv_subblock_ptr = \
         relaxation.schwarz_parameters(lvl.Acsr, subdomain, subdomain_ptr,
                                       inv_subblock, inv_subblock_ptr)
+
+    if work is not None:
+        # Setup cost: extract subblocks (graph) + invert each block (numerical)
+        blocksizes = subdomain_ptr[1:] - subdomain_ptr[:-1]
+        # Graph work: scan A sparsity pattern to extract subblocks
+        work[1] += lvl.Acsr.nnz
+        # Numerical work: dense factorization ~ domain_size^3 / 3 per block
+        work[0] += int(np.sum(blocksizes ** 3) // 3)
 
     def smoother(A, x, b):
         relaxation.schwarz(lvl.Acsr, x, b, iterations=iterations,
@@ -529,7 +567,7 @@ def setup_schwarz(lvl, iterations=DEFAULT_NITER, subdomain=None,
 
 
 def setup_strength_based_schwarz(lvl, iterations=DEFAULT_NITER,
-                                 sweep=DEFAULT_SWEEP):
+                                 sweep=DEFAULT_SWEEP, work=None):
     """Set up strength-based Schwarz."""
     # Use the overlapping regions defined by strength of connection matrix C
     # for the overlapping Schwarz method
@@ -542,6 +580,12 @@ def setup_strength_based_schwarz(lvl, iterations=DEFAULT_NITER,
     subdomain_ptr = C.indptr.copy()
     subdomain = C.indices.copy()
 
+    # Count setup work once here (same formula as setup_schwarz)
+    if work is not None:
+        blocksizes = subdomain_ptr[1:] - subdomain_ptr[:-1]
+        work[1] += lvl.A.nnz
+        work[0] += int(np.sum(blocksizes ** 3) // 3)
+
     def strength_based_schwarz(A, x, b):
         smoother = setup_schwarz(lvl, iterations=iterations, subdomain=subdomain,
                                  subdomain_ptr=subdomain_ptr, sweep=sweep)
@@ -550,7 +594,7 @@ def setup_strength_based_schwarz(lvl, iterations=DEFAULT_NITER,
 
 
 def setup_block_jacobi(lvl, iterations=DEFAULT_NITER, omega=1.0, Dinv=None,
-                       blocksize=None, withrho=True):
+                       blocksize=None, withrho=True, work=None):
     """Set up block Jacobi."""
     # Determine Blocksize
     if blocksize is None and Dinv is None:
@@ -563,7 +607,8 @@ def setup_block_jacobi(lvl, iterations=DEFAULT_NITER, omega=1.0, Dinv=None,
 
     if blocksize == 1:
         # Block Jacobi is equivalent to normal Jacobi
-        smoother = setup_jacobi(lvl, iterations=iterations, omega=omega, withrho=withrho)
+        smoother = setup_jacobi(lvl, iterations=iterations, omega=omega, withrho=withrho,
+                                work=work)
         update_wrapper(smoother, relaxation.block_jacobi)  # set __name__
         return smoother
 
@@ -571,7 +616,7 @@ def setup_block_jacobi(lvl, iterations=DEFAULT_NITER, omega=1.0, Dinv=None,
     if Dinv is None:
         Dinv = get_block_diag(lvl.A, blocksize=blocksize, inv_flag=True)
     if withrho:
-        omega = omega/rho_block_D_inv_A(lvl.A, Dinv)
+        omega = omega/rho_block_D_inv_A(lvl.A, Dinv, work=work)
 
     smoother = partial(relaxation.block_jacobi, iterations=iterations, omega=omega,
                        Dinv=Dinv, blocksize=blocksize)
@@ -608,9 +653,9 @@ def setup_block_gauss_seidel(lvl, iterations=DEFAULT_NITER,
     return smoother
 
 
-def setup_richardson(lvl, iterations=DEFAULT_NITER, omega=1.0):
+def setup_richardson(lvl, iterations=DEFAULT_NITER, omega=1.0, work=None):
     """Set up Richardson."""
-    omega = omega/approximate_spectral_radius(lvl.A)
+    omega = omega/approximate_spectral_radius(lvl.A, work=work)
 
     def richardson(A, x, b):
         relaxation.polynomial(A, x, b, coefficients=[omega], iterations=iterations)
@@ -625,9 +670,9 @@ def setup_sor(lvl, omega=0.5, iterations=DEFAULT_NITER, sweep=DEFAULT_SWEEP):
 
 
 def setup_chebyshev(lvl, lower_bound=1.0/30.0, upper_bound=1.1, degree=3,
-                    iterations=DEFAULT_NITER):
+                    iterations=DEFAULT_NITER, work=None):
     """Set up Chebyshev."""
-    rho = approximate_spectral_radius(lvl.A)
+    rho = approximate_spectral_radius(lvl.A, work=work)
     a = rho * lower_bound
     b = rho * upper_bound
     # drop the constant coefficient
@@ -638,11 +683,11 @@ def setup_chebyshev(lvl, lower_bound=1.0/30.0, upper_bound=1.1, degree=3,
     return chebyshev
 
 
-def setup_jacobi_ne(lvl, iterations=DEFAULT_NITER, omega=1.0, withrho=True):
+def setup_jacobi_ne(lvl, iterations=DEFAULT_NITER, omega=1.0, withrho=True, work=None):
     """Set up Jacobi NE."""
     matrix_asformat(lvl, 'A', 'csr')
     if withrho:
-        omega = omega/rho_D_inv_A(lvl.Acsr)**2
+        omega = omega/rho_D_inv_A(lvl.Acsr, work=work)**2
 
     def smoother(A, x, b):
         relaxation.jacobi_ne(lvl.Acsr, x, b, iterations=iterations,
@@ -676,10 +721,10 @@ def setup_gauss_seidel_nr(lvl, iterations=DEFAULT_NITER, sweep=DEFAULT_SWEEP,
 
 
 def setup_cf_jacobi(lvl, f_iterations=DEFAULT_NITER, c_iterations=DEFAULT_NITER,
-                    iterations=DEFAULT_NITER, omega=1.0, withrho=False):
+                    iterations=DEFAULT_NITER, omega=1.0, withrho=False, work=None):
     """Set up coarse-fine Jacobi."""
     if withrho:
-        omega = omega/rho_D_inv_A(lvl.A)
+        omega = omega/rho_D_inv_A(lvl.A, work=work)
 
     Fpts, Cpts = _extract_splitting(lvl)
 
@@ -691,10 +736,10 @@ def setup_cf_jacobi(lvl, f_iterations=DEFAULT_NITER, c_iterations=DEFAULT_NITER,
 
 
 def setup_fc_jacobi(lvl, f_iterations=DEFAULT_NITER, c_iterations=DEFAULT_NITER,
-                    iterations=DEFAULT_NITER, omega=1.0, withrho=False):
+                    iterations=DEFAULT_NITER, omega=1.0, withrho=False, work=None):
     """Set up fine-coarse Jacobi."""
     if withrho:
-        omega = omega/rho_D_inv_A(lvl.A)
+        omega = omega/rho_D_inv_A(lvl.A, work=work)
 
     Fpts, Cpts = _extract_splitting(lvl)
 

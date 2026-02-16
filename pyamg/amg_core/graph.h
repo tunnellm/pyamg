@@ -126,7 +126,7 @@ I maximal_independent_set_serial(const I num_rows,
  * Returns
  * -------
  * int
- *     The number of nodes in the MIS.
+ *     The number of iterations performed.
  *
  * Notes
  * -----
@@ -145,7 +145,8 @@ I maximal_independent_set_parallel(const I num_rows,
                                    const T  F,
                                          T  x[], const int  x_size,
                                    const R  y[], const int  y_size,
-                                   const I  max_iters)
+                                   const I  max_iters,
+                                         I  iters_out[], const int iters_out_size)
 {
     I N = 0;
     I num_iters = 0;
@@ -199,6 +200,9 @@ I maximal_independent_set_parallel(const I num_rows,
         }
     } // end while
 
+    if(iters_out_size > 0){
+        iters_out[0] = num_iters;
+    }
     return N;
 }
 
@@ -310,7 +314,8 @@ T vertex_coloring_jones_plassmann(const I num_rows,
     T K = 0; //iteration number
 
     while(N < num_rows){
-        N += maximal_independent_set_parallel(num_rows,Ap,Ap_size,Aj,Aj_size,-1,K,-2,x,x_size,z,z_size,1);
+        I dummy_iters[1] = {0};
+        N += maximal_independent_set_parallel(num_rows,Ap,Ap_size,Aj,Aj_size,-1,K,-2,x,x_size,z,z_size,1,dummy_iters,1);
         for(I i = 0; i < num_rows; i++){
             if(x[i] == -2)
                 x[i] = -1;
@@ -374,7 +379,8 @@ T vertex_coloring_LDF(const I num_rows,
             weights[i] = y[i] + num_neighbors;
         }
 
-        N += maximal_independent_set_parallel(num_rows,Ap,Ap_size,Aj,Aj_size,-1,K,-2,x,x_size,&weights[0],num_rows,1);
+        I dummy_iters[1] = {0};
+        N += maximal_independent_set_parallel(num_rows,Ap,Ap_size,Aj,Aj_size,-1,K,-2,x,x_size,&weights[0],num_rows,1,dummy_iters,1);
         for(I i = 0; i < num_rows; i++){
             if(x[i] == -2)
                 x[i] = -1;

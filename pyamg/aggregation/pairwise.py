@@ -104,6 +104,9 @@ def pairwise_solver(A,
     if np.iscomplexobj(A.data):
         raise ValueError('Pairwise solver not verified for complex matrices')
 
+    # Track work: [numerical_work, graph_work]
+    work = [0, 0]
+
     # Levelize the user parameters, so that they become lists describing the
     # desired user option on each level.
     max_levels, max_coarse, aggregate =\
@@ -116,14 +119,15 @@ def pairwise_solver(A,
 
     while len(levels) < max_levels and\
             int(levels[-1].A.shape[0]/get_blocksize(levels[-1].A)) > max_coarse:
-        _extend_hierarchy(levels, aggregate)
+        _extend_hierarchy(levels, aggregate, work)
 
     ml = MultilevelSolver(levels, **kwargs)
-    change_smoothers(ml, presmoother, postsmoother)
+    change_smoothers(ml, presmoother, postsmoother, work=work)
+    ml._setup_work = tuple(work)
     return ml
 
 
-def _extend_hierarchy(levels, aggregate):
+def _extend_hierarchy(levels, aggregate, work):
     """Extend the multigrid hierarchy."""
     def unpack_arg(v):
         if isinstance(v, tuple):
@@ -131,18 +135,28 @@ def _extend_hierarchy(levels, aggregate):
         return v, {}
 
     A = levels[-1].A
+    n = A.shape[0]
 
     # Compute pairwise interpolation and restriction matrices, R=P^*
     _, kwargs = unpack_arg(aggregate[len(levels)-1])
-    P = pairwise_aggregation(A, **kwargs, compute_P=True)[0]
+    P = pairwise_aggregation(A, work=work, **kwargs, compute_P=True)[0]
+
+    # Transpose to get R
     R = P.T.conjugate()
+    work[1] += P.nnz  # transpose is graph work
+
     if issparse(P) and P.format == 'csr':
         # In this case, R will be CSC, which must be changed
         R = R.tocsr()
+        work[1] += R.nnz  # CSC to CSR conversion
 
     levels[-1].P = P  # unsmoothed prolongator
     levels[-1].R = R  # restriction operator
 
+    # RAP triple product: two SpGEMMs
     levels.append(MultilevelSolver.Level())
-    A = R @ A @ P              # Galerkin operator
+    rap_cost = R.nnz * A.nnz // n + A.nnz * P.nnz // n
+    work[0] += rap_cost  # numerical
+    work[1] += rap_cost  # graph
+    A = R @ A @ P
     levels[-1].A = A

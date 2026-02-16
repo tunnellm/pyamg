@@ -47,17 +47,20 @@ I _maximal_independent_set_parallel(
                 const T F,
        py::array_t<T> & x,
        py::array_t<R> & y,
-        const I max_iters
+        const I max_iters,
+       py::array_t<I> & iters_out
                                     )
 {
     auto py_Ap = Ap.unchecked();
     auto py_Aj = Aj.unchecked();
     auto py_x = x.mutable_unchecked();
     auto py_y = y.unchecked();
+    auto py_iters_out = iters_out.mutable_unchecked();
     const I *_Ap = py_Ap.data();
     const I *_Aj = py_Aj.data();
     T *_x = py_x.mutable_data();
     const R *_y = py_y.data();
+    I *_iters_out = py_iters_out.mutable_data();
 
     return maximal_independent_set_parallel<I, T, R>(
                  num_rows,
@@ -68,7 +71,8 @@ I _maximal_independent_set_parallel(
                         F,
                        _x, x.shape(0),
                        _y, y.shape(0),
-                max_iters
+                max_iters,
+             _iters_out, iters_out.shape(0)
                                                      );
 }
 
@@ -538,7 +542,7 @@ be assigned the value C or F depending on whether they are in the
 MIS or not.)pbdoc");
 
     m.def("maximal_independent_set_parallel", &_maximal_independent_set_parallel<int, int, double>,
-        py::arg("num_rows"), py::arg("Ap").noconvert(), py::arg("Aj").noconvert(), py::arg("active"), py::arg("C"), py::arg("F"), py::arg("x").noconvert(), py::arg("y").noconvert(), py::arg("max_iters"),
+        py::arg("num_rows"), py::arg("Ap").noconvert(), py::arg("Aj").noconvert(), py::arg("active"), py::arg("C"), py::arg("F"), py::arg("x").noconvert(), py::arg("y").noconvert(), py::arg("max_iters"), py::arg("iters_out").noconvert(),
 R"pbdoc(
 Parallel maximal independent set.
 
@@ -565,6 +569,8 @@ y : array
     Random values for each vertex.
 max_iters : int
     Maximum number of iterations By default max_iters=-1 and no limit is imposed.
+iters_out : array, output
+    Array to store the number of iterations (size 1).
 
 Returns
 -------

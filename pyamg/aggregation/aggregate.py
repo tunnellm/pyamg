@@ -9,13 +9,15 @@ from ..graph import lloyd_cluster, balanced_lloyd_cluster, metis_partition
 from ..strength import classical_strength_of_connection
 
 
-def standard_aggregation(C):
+def standard_aggregation(C, work=None):
     """Compute the sparsity pattern of the tentative prolongator.
 
     Parameters
     ----------
     C : csr_array
         Strength of connection matrix.
+    work : list or None
+        If provided, a 2-element list [numerical_work, graph_work] to accumulate counts.
 
     Returns
     -------
@@ -73,6 +75,13 @@ def standard_aggregation(C):
     num_aggregates = fn(num_rows, C.indptr, C.indices, Tj, Cpts)
     Cpts = Cpts[:num_aggregates]
 
+    # Graph work: init (n) + 3 passes (each: n row checks + nnz neighbor visits)
+    # Pass 1: decoupled aggregation - check neighbors, form aggregates
+    # Pass 2: cleanup - add unaggregated to neighboring aggregates
+    # Pass 3: assignment - finalize aggregate numbers
+    if work is not None:
+        work[1] += 4 * num_rows + 3 * C.nnz
+
     # no nodes aggregated
     if num_aggregates == 0:
         # return all zero matrix and no Cpts
@@ -95,13 +104,15 @@ def standard_aggregation(C):
     return sparse.csr_array((Tx, Tj, Tp), shape=shape), Cpts
 
 
-def naive_aggregation(C):
+def naive_aggregation(C, work=None):
     """Compute the sparsity pattern of the tentative prolongator.
 
     Parameters
     ----------
     C : csr_array
         Strength of connection matrix.
+    work : list or None
+        If provided, a 2-element list [numerical_work, graph_work] to accumulate counts.
 
     Returns
     -------
@@ -167,6 +178,10 @@ def naive_aggregation(C):
     Cpts = Cpts[:num_aggregates]
     Tj = Tj - 1
 
+    # Graph work: array init (n) + single pass over CSR (nnz)
+    if work is not None:
+        work[1] += num_rows + C.nnz
+
     if num_aggregates == 0:
         # all zero matrix
         return sparse.csr_array((num_rows, 1), dtype=np.int32), Cpts
@@ -179,7 +194,7 @@ def naive_aggregation(C):
 
 
 def pairwise_aggregation(A, matchings=2, theta=0.25,
-                         norm='min', compute_P=False):
+                         norm='min', compute_P=False, work=None):
     """Compute the sparsity pattern of the tentative prolongator.
 
     Parameters
@@ -199,6 +214,8 @@ def pairwise_aggregation(A, matchings=2, theta=0.25,
         If True, return float interpolation P, converting to BSR
         form with identity of size bsize x bsize on each aggregate
         if A is BSR.
+    work : list or None
+        If provided, a 2-element list [numerical_work, graph_work] to accumulate counts.
 
     Examples
     --------
@@ -251,9 +268,11 @@ def pairwise_aggregation(A, matchings=2, theta=0.25,
 
         # Compute SOC matrix for this matching
         if sparse.issparse(A) and A.format == 'bsr':
-            C = classical_strength_of_connection(A=Ac, theta=theta, block=True, norm=norm)
+            C = classical_strength_of_connection(A=Ac, theta=theta, block=True, norm=norm,
+                                                 work=work)
         else:
-            C = classical_strength_of_connection(A=Ac, theta=theta, block=False, norm=norm)
+            C = classical_strength_of_connection(A=Ac, theta=theta, block=False, norm=norm,
+                                                 work=work)
 
         # Form pairwise aggregation matrix
         num_rows = C.shape[0]
@@ -261,6 +280,11 @@ def pairwise_aggregation(A, matchings=2, theta=0.25,
         new_cpts = np.empty(num_rows, dtype=index_type)  # stores the new_cpts
         fn = amg_core.pairwise_aggregation
         num_aggregates = fn(num_rows, C.indptr, C.indices, C.data, Tj, new_cpts)
+
+        # Graph work: init (n) + neighbor count pass (nnz) + matching pass (nnz)
+        if work is not None:
+            work[1] += num_rows + 2 * C.nnz
+
         if Cpts is None:
             Cpts = new_cpts[:num_aggregates]
         else:
@@ -288,9 +312,25 @@ def pairwise_aggregation(A, matchings=2, theta=0.25,
         if i == 0:
             T = T_temp
         elif sparse.issparse(A) and A.format == 'bsr':
+            # Capture input dimensions before multiply for SpMM cost
+            old_T_nnz = T.nnz
+            old_T_cols = T.shape[1]
             T = sparse.bsr_array(T @ T_temp)
+            # SpMM work: nnz(A) * nnz(B) / cols(A) for C = A @ B
+            if work is not None:
+                spmm_cost = old_T_nnz * T_temp.nnz // old_T_cols
+                work[0] += spmm_cost
+                work[1] += spmm_cost
         else:
+            # Capture input dimensions before multiply for SpMM cost
+            old_T_nnz = T.nnz
+            old_T_cols = T.shape[1]
             T = sparse.csr_array(T @ T_temp)
+            # SpMM work: nnz(A) * nnz(B) / cols(A) for C = A @ B
+            if work is not None:
+                spmm_cost = old_T_nnz * T_temp.nnz // old_T_cols
+                work[0] += spmm_cost
+                work[1] += spmm_cost
 
         # Break loop if zero aggregates were found
         if num_aggregates == 0:
@@ -299,18 +339,32 @@ def pairwise_aggregation(A, matchings=2, theta=0.25,
         # Form coarse grid operator for next matching
         if i < (matchings-1):
             if sparse.issparse(T_temp) and T_temp.format == 'csr':
-                Ac = T_temp.T.tocsr() @ Ac @ T_temp
+                R = T_temp.T.tocsr()
+                Ac = R @ Ac @ T_temp
             else:
-                Ac = T_temp.T @ Ac @ T_temp
+                R = T_temp.T
+                Ac = R @ Ac @ T_temp
+
+            # RAP work: nnz(R)*nnz(Ac)/n + nnz(Ac)*nnz(T_temp)/n for numerical and graph
+            if work is not None:
+                n_mid = Ac.shape[0]
+                rap_cost = (R.nnz * Ac.nnz + Ac.nnz * T_temp.nnz) // n_mid
+                work[0] += rap_cost
+                work[1] += rap_cost
 
     # Convert T to dtype int if only used for aggregation
     if compute_P:
         T = T.astype(A.dtype, copy=False)
 
+    # Ensure aggregation matrix is CSR (required by fit_candidates)
+    # When input A is BSR, T may be BSR, but aggregation operators must be CSR
+    if sparse.issparse(T) and T.format == 'bsr':
+        T = T.tocsr()
+
     return T, Cpts
 
 
-def lloyd_aggregation(C, ratio=0.1, measure='unit', maxiter=5):
+def lloyd_aggregation(C, ratio=0.1, measure='unit', maxiter=5, work=None):
     """Aggregate nodes using Lloyd Clustering.
 
     Parameters
@@ -404,7 +458,7 @@ def lloyd_aggregation(C, ratio=0.1, measure='unit', maxiter=5):
 
     G = C.__class__((data, C.indices, C.indptr), shape=C.shape)
 
-    clusters, centers = lloyd_cluster(G, naggs, maxiter=maxiter)
+    clusters, centers = lloyd_cluster(G, naggs, maxiter=maxiter, work=work)
 
     if np.any(clusters < 0):
         warn('Lloyd aggregation encountered a point that is unaggregated.')
@@ -422,7 +476,7 @@ def lloyd_aggregation(C, ratio=0.1, measure='unit', maxiter=5):
 
 
 def balanced_lloyd_aggregation(C, ratio=0.1, measure=None, maxiter=5,
-                               rebalance_iters=5, pad=None, A=None):
+                               rebalance_iters=5, pad=None, A=None, work=None):
     """Aggregate nodes using Balanced Lloyd Clustering.
 
     Parameters
@@ -544,7 +598,7 @@ def balanced_lloyd_aggregation(C, ratio=0.1, measure=None, maxiter=5,
     G = C.__class__((data, C.indices, C.indptr), shape=C.shape)
 
     clusters, centers = balanced_lloyd_cluster(G, naggs, maxiter=maxiter,
-                                               rebalance_iters=rebalance_iters)
+                                               rebalance_iters=rebalance_iters, work=work)
 
     if np.any(clusters < 0):
         warn('Lloyd aggregation encountered a point that is unaggregated.')

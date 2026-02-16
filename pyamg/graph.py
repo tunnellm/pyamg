@@ -71,7 +71,8 @@ def maximal_independent_set(G, algo='serial', k=None):
             fn(N, G.indptr, G.indices, -1, 1, 0, mis)
         elif algo == 'parallel':
             fn = amg_core.maximal_independent_set_parallel
-            fn(N, G.indptr, G.indices, -1, 1, 0, mis, np.random.rand(N), -1)
+            iters_out = np.zeros(1, dtype='intc')
+            fn(N, G.indptr, G.indices, -1, 1, 0, mis, np.random.rand(N), -1, iters_out)
         else:
             raise ValueError(f'Unknown algorithm ({algo})')
     else:
@@ -200,7 +201,7 @@ def bellman_ford(G, centers, method='standard', tiebreaking=True):
     return distances, nearest, predecessors
 
 
-def lloyd_cluster(G, centers, maxiter=5):
+def lloyd_cluster(G, centers, maxiter=5, work=None):
     """Perform Lloyd clustering on graph with weighted edges.
 
     Parameters
@@ -214,6 +215,8 @@ def lloyd_cluster(G, centers, maxiter=5):
         and n-1 that will be used as the initial centers for clustering.
     maxiter : int
         Maximum number of iterations.
+    work : list or None
+        If provided, a 2-element list [numerical_work, graph_work] to accumulate counts.
 
     Returns
     -------
@@ -265,7 +268,8 @@ def lloyd_cluster(G, centers, maxiter=5):
     changed = True
     it = 0
 
-    _dist, _near, _pred = bellman_ford(G, centers, method='standard')
+    # Results not used; commented out to avoid unnecessary work
+    # _dist, _near, _pred = bellman_ford(G, centers, method='standard')
 
     while changed and it < maxiter:
         if it > 0:
@@ -281,12 +285,18 @@ def lloyd_cluster(G, centers, maxiter=5):
         changed = amg_core.most_interior_nodes(n, G.indptr, G.indices, G.data, centers,
                                                distances, clusters, predecessors)
 
+        if work is not None:
+            # Per iteration: Bellman-Ford (nnz adds) + center updates (nnz traversals)
+            work[0] += G.nnz        # numerical (distance additions)
+            work[1] += 2 * G.nnz    # graph (Bellman-Ford + center update traversals)
+
         it += 1
 
     return clusters, centers
 
 
-def balanced_lloyd_cluster(G, centers, maxiter=5, rebalance_iters=5, tiebreaking=True):
+def balanced_lloyd_cluster(G, centers, maxiter=5, rebalance_iters=5, tiebreaking=True,
+                           work=None):
     """Perform Lloyd clustering on graph with weighted edges.
 
     Parameters
@@ -305,6 +315,8 @@ def balanced_lloyd_cluster(G, centers, maxiter=5, rebalance_iters=5, tiebreaking
         Number of post-Lloyd rebalancing iterations to run.
     tiebreaking : bool, default True
         Flag for triggering tiebreaking.
+    work : list or None
+        If provided, a 2-element list [numerical_work, graph_work] to accumulate counts.
 
     Returns
     -------
@@ -407,6 +419,17 @@ def balanced_lloyd_cluster(G, centers, maxiter=5, rebalance_iters=5, tiebreaking
             changed2 = amg_core.center_nodes(n, G.indptr, G.indices, G.data,
                                              Cptr, D, P, CC, L, q,
                                              centers, d, m, p, pc, s)
+
+            if work is not None:
+                # Per iteration: Bellman-Ford (nnz adds) + center updates (nnz traversals)
+                work[0] += G.nnz        # numerical (distance additions)
+                work[1] += 2 * G.nnz    # graph (Bellman-Ford + center update traversals)
+                # Floyd-Warshall in center_nodes: O(N³) per cluster where N is cluster size
+                # Numerical: 2*N³ (D[ik]+D[kj] and +tol per iteration)
+                # Graph: N³ (P[ij]=P[kj] stores, upper bound)
+                s_cubed = int(np.sum(s.astype(np.int64)**3))
+                work[0] += 2 * s_cubed
+                work[1] += s_cubed
 
             it += 1
 
