@@ -418,6 +418,28 @@ class MultilevelSolver:
 
             return costs[level] + 2 * AMLI(level + 1) + amli_overhead
 
+        def K(level):
+            """K-cycle: nK FCG iterations (Alg 3.1, m_i=1) at each level.
+
+            nK recursive K-cycle applies,
+            nK SpMVs on A_c (one per FCG iteration for A@d),
+            Iteration 0: 4*n_c vector ops (2 dots + 2 axpys),
+            Iterations 1..nK-1: 6*n_c each (3 dots + 3 axpys).
+            """
+            if len(self.levels) == 1:
+                return coarse_cost
+
+            if level == len(self.levels) - 2:
+                return costs[level] + coarse_cost
+
+            nK = getattr(self, '_k_cg_iters', 2)
+            Ac = self.levels[level + 1].A
+            n_c = Ac.shape[0]
+            recursive_cost = nK * K(level + 1)
+            spmv_cost = nK * Ac.nnz
+            vector_cost = 4 * n_c + max(0, nK - 1) * 6 * n_c
+            return costs[level] + recursive_cost + spmv_cost + vector_cost
+
         if cycle == 'V':
             flops = V(0)
         elif cycle == 'W':
@@ -426,10 +448,72 @@ class MultilevelSolver:
             flops = AMLI(0)
         elif cycle == 'F':
             flops = F(0)
+        elif cycle == 'K':
+            flops = K(0)
         else:
             raise TypeError(f'Unrecognized cycle type ({cycle})')
 
         return float(flops) / float(self.levels[0].A.nnz)
+
+    def _precompute_k_costs(self):
+        """Precompute and cache per-level fixed costs for K-cycle accounting.
+
+        Stores _k_level_costs[lvl] = smoothing + residual + transfer cost
+        at each level, and _k_coarse_cost for the coarsest level solve.
+        These are absolute flop counts (not normalized by nnz).
+        """
+        import functools
+
+        def smoother_cost(smoother, A):
+            """Compute cost multiplier for a smoother relative to nnz(A)."""
+            if smoother is None:
+                return 1
+            iterations = 1
+            sweep_factor = 1
+            degree = 1
+            if isinstance(smoother, functools.partial):
+                iterations = smoother.keywords.get('iterations', 1)
+                sweep = smoother.keywords.get('sweep', 'forward')
+                if sweep == 'symmetric':
+                    sweep_factor = 2
+            elif callable(smoother):
+                if hasattr(smoother, '__closure__') and smoother.__closure__:
+                    for varname, cell in zip(smoother.__code__.co_freevars,
+                                             smoother.__closure__):
+                        if varname == 'coefficients':
+                            degree = len(cell.cell_contents)
+                        elif varname == 'iterations':
+                            iterations = cell.cell_contents
+                        elif varname == 'sweep':
+                            if cell.cell_contents == 'symmetric':
+                                sweep_factor = 2
+            blocksize = getattr(A, 'blocksize', (1, 1))[0]
+            block_factor = blocksize * blocksize if blocksize > 1 else 1
+            return iterations * degree * sweep_factor * block_factor
+
+        self._k_level_costs = []
+        for level in self.levels[:-1]:
+            pre_cost = smoother_cost(getattr(level, 'presmoother', None),
+                                     level.A)
+            post_cost = smoother_cost(getattr(level, 'postsmoother', None),
+                                      level.A)
+            smooth_work = (pre_cost + post_cost) * level.A.nnz
+            residual_work = level.A.nnz
+            R_nnz = level.R.nnz if hasattr(level, 'R') else 0
+            P_nnz = level.P.nnz if hasattr(level, 'P') else 0
+            transfer_work = R_nnz + P_nnz
+            self._k_level_costs.append(smooth_work + residual_work
+                                       + transfer_work)
+
+        coarse_A = self.levels[-1].A
+        coarse_n = coarse_A.shape[0]
+        dense_solvers = {'pinv', 'pinv2', 'lu', 'cholesky'}
+        solver_name = _get_coarse_solver_name(
+            getattr(self, 'coarse_solver', None))
+        if solver_name in dense_solvers:
+            self._k_coarse_cost = coarse_n * coarse_n
+        else:
+            self._k_coarse_cost = coarse_A.nnz
 
     def operator_complexity(self):
         """Operator complexity of this multigrid hierarchy.
@@ -579,7 +663,7 @@ class MultilevelSolver:
 
         Parameters
         ----------
-        cycle : {'V','W','F','AMLI'}
+        cycle : {'V','W','F','AMLI','K'}
             Type of multigrid cycle to perform in each iteration.
 
         Returns
@@ -814,7 +898,7 @@ class MultilevelSolver:
             Initial guess ``x``.
         b : numpy array
             Right-hand side for ``Ax=b``.
-        cycle : {'V','W','F','AMLI'}
+        cycle : {'V','W','F','AMLI','K'}
             Recursively called cycling function.  The
             Defines the cycling used::
 
@@ -822,6 +906,15 @@ class MultilevelSolver:
                 cycle='W':    W-cycle
                 cycle='F':    F-cycle
                 cycle='AMLI': AMLI-cycle
+                cycle='K':    K-cycle (Notay's recursive Krylov cycle)
+
+        Returns
+        -------
+        int
+            Flop cost of this cycle application.  For fixed cycles (V, W, F,
+            AMLI) returns 0 (use cycle_complexity instead).  For K-cycles,
+            returns the actual flop count since the adaptive iteration count
+            makes cost variable.
 
         cycles_per_level : int, default 1
             Number of V-cycles on each level of an F-cycle.
@@ -836,8 +929,14 @@ class MultilevelSolver:
         coarse_b = self.levels[lvl].R @ residual
         coarse_x = np.zeros_like(coarse_b)
 
+        flops = 0  # accumulated for K-cycle; 0 for fixed cycles
+
         if lvl == len(self.levels) - 2:
             coarse_x[:] = self.coarse_solver(self.levels[-1].A, coarse_b)
+            if cycle == 'K':
+                if not hasattr(self, '_k_level_costs'):
+                    self._precompute_k_costs()
+                flops = self._k_level_costs[lvl] + self._k_coarse_cost
         elif cycle == 'V':
             self.__solve(lvl + 1, coarse_x, coarse_b, 'V')
         elif cycle == 'W':
@@ -876,12 +975,80 @@ class MultilevelSolver:
 
                 # Update residual
                 coarse_b -= alpha * Ap.reshape(coarse_b.shape)
+        elif cycle == 'K':
+            # K-cycle: up to ℓ iterations of FCG (Algorithm 3.1, m_i=1) at
+            # each level, preconditioned by recursive K-cycle on next level.
+            # Reference: Notay & Vassilevski, "Recursive Krylov-based multigrid
+            # cycles", Numer. Linear Algebra Appl. 15:473-487, 2008.
+            #
+            # _k_cg_iters: max FCG iterations per level (paper's ℓ)
+            # _k_early_exit: residual ratio threshold for early exit, or 0
+            #   to force exactly _k_cg_iters iterations.
+
+            # Ensure per-level fixed costs are precomputed
+            if not hasattr(self, '_k_level_costs'):
+                self._precompute_k_costs()
+
+            Ac = self.levels[lvl + 1].A
+            n_c = Ac.shape[0]
+            nK = getattr(self, '_k_cg_iters', 2)
+            early_exit = getattr(self, '_k_early_exit', 0.0)
+
+            # Start with this level's fixed costs (smoothing + residual + transfers)
+            level_cost = self._k_level_costs[lvl]
+
+            # FCG Algorithm 3.1 with m_i=1 to solve Ac @ y = coarse_b
+            r = coarse_b.copy()
+            norm_r0_sq = np.inner(r.conj(), r) if early_exit > 0 else 0
+
+            # Iteration 0: w = K^{-1} r, d = w (no previous direction)
+            w = np.zeros_like(r)
+            level_cost += self.__solve(lvl + 1, w, r, 'K')
+
+            d = w.copy()
+            Ad = Ac @ d                         # 1 SpMV
+            level_cost += Ac.nnz
+            dAd = np.inner(d.conj(), Ad)
+            alpha = np.inner(d.conj(), r) / dAd
+            coarse_x += alpha * d
+            r -= alpha * Ad
+            level_cost += 4 * n_c               # 2 dots + 2 axpys
+
+            for _ in range(1, nK):
+                # Early exit: skip remaining iterations if residual is small
+                if early_exit > 0:
+                    norm_r_sq = np.inner(r.conj(), r)
+                    if norm_r_sq < early_exit * early_exit * norm_r0_sq:
+                        break
+
+                # w = K^{-1} r (preconditioner apply)
+                w[:] = 0
+                level_cost += self.__solve(lvl + 1, w, r, 'K')
+
+                # A-orthogonalize: d_new = w - (w'Ad / d'Ad) d
+                # By symmetry: w'Ad = (Ac@w)'d, but we already have Ad
+                beta = np.inner(w.conj(), Ad) / dAd
+                d = w - beta * d
+                level_cost += 2 * n_c           # 1 dot + 1 axpy
+
+                # Step size and update
+                Ad = Ac @ d                     # 1 SpMV
+                level_cost += Ac.nnz
+                dAd = np.inner(d.conj(), Ad)
+                alpha = np.inner(d.conj(), r) / dAd
+                coarse_x += alpha * d
+                r -= alpha * Ad
+                level_cost += 4 * n_c           # 2 dots + 2 axpys
+
+            flops = level_cost
         else:
             raise TypeError(f'Unrecognized cycle type ({cycle})')
 
         x += self.levels[lvl].P @ coarse_x   # coarse grid correction
 
         self.levels[lvl].postsmoother(A, x, b)
+
+        return flops
 
 
 def coarse_grid_solver(solver):
