@@ -13,6 +13,7 @@ from ..util.linalg import norm, approximate_spectral_radius
 from ..util.utils import amalgamate, levelize_strength_or_aggregation, \
     levelize_smooth_or_improve_candidates, asfptype
 from ..relaxation.smoothing import change_smoothers, rho_D_inv_A
+from ..util.sparse_blas import rap as _rap, rap_compatible as _rap_ok
 from ..relaxation.relaxation import gauss_seidel, gauss_seidel_nr, \
     gauss_seidel_ne, gauss_seidel_indexed, jacobi, polynomial
 from .aggregation import smoothed_aggregation_solver
@@ -534,11 +535,15 @@ def initial_setup_stage(A, symmetry, pdef, candidate_iters, epsilon,
 
         # R should reflect A's structure # step 4e
         if symmetry == 'symmetric':
-            A_l = P_l.T.asformat(P_l.format) @ A_l @ P_l
+            R_l = P_l.T.asformat(P_l.format)
         elif symmetry == 'hermitian':
-            A_l = P_l.T.conjugate().asformat(P_l.format) @ A_l @ P_l
+            R_l = P_l.T.conjugate().asformat(P_l.format)
         else:
             raise ValueError(f'aSA not implemented for symmetry={symmetry}.')
+        if _rap_ok(R_l, A_l, P_l):
+            A_l = _rap(R_l, A_l, P_l)
+        else:
+            A_l = R_l @ A_l @ P_l
 
         StrengthOps.append(C_l)
         AggOps.append(AggOp)
@@ -722,7 +727,11 @@ def general_setup_stage(ml, symmetry, candidate_iters, prepostsmoother,
             levels[i].R = levels[i].P.T.conjugate().asformat(levels[i].P.format)
 
         # construct coarse A
-        levels[i+1].A = levels[i].R @ levels[i].A @ levels[i].P
+        R_i, A_i, P_i = levels[i].R, levels[i].A, levels[i].P
+        if _rap_ok(R_i, A_i, P_i):
+            levels[i+1].A = _rap(R_i, A_i, P_i)
+        else:
+            levels[i+1].A = R_i @ A_i @ P_i
 
         # construct bridging P
         T_bridge = make_bridge(levels[i+1].T)

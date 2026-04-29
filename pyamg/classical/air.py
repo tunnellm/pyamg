@@ -11,6 +11,7 @@ from ..strength import (classical_strength_of_connection,
                         distance_strength_of_connection, algebraic_distance,
                         affinity_distance, energy_based_strength_of_connection)
 from ..util.utils import filter_matrix_rows, asfptype
+from ..util.sparse_blas import rap as _rap, rap_compatible as _rap_ok
 from ..classical.interpolate import (direct_interpolation, classical_interpolation,
                                      injection_interpolation, one_point_interpolation,
                                      local_air)
@@ -229,7 +230,10 @@ def extend_hierarchy(levels, strength, CF, interpolation, restrict, filter_opera
     levels[-1].R = R                               # restriction operator
 
     # RAP = R*(A*P)
-    A = R @ A @ P
+    if _rap_ok(R, A, P):
+        A = _rap(R, A, P)
+    else:
+        A = R @ A @ P
 
     # Make sure coarse-grid operator is in correct sparse format
     if issparse(P) and P.format == 'csr' and issparse(A) and A.format != 'csr':
