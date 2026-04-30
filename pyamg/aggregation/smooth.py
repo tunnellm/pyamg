@@ -8,8 +8,9 @@ import scipy.linalg as la
 from .. import amg_core
 from ..util.utils import scale_rows, get_diagonal, get_block_diag, \
     unamal, filter_operator, compute_BtBinv, filter_matrix_rows, \
-    truncate_rows
+    truncate_rows, spmm_work, spmm_graph_work
 from ..util.linalg import approximate_spectral_radius
+from ..util.sparse_blas import matmat
 from ..util import upcast
 
 
@@ -208,10 +209,10 @@ def jacobi_prolongation_smoother(S, T, C, B, omega=4.0/3.0, degree=1,
         P = T
         for _ in range(degree):
             if work is not None:
-                spmm_cost = S.nnz * P.nnz // n
+                spmm_cost = spmm_work(D_inv_S, P)
                 work[0] += spmm_cost + P.nnz  # SpMM + subtraction
-                work[1] += spmm_cost  # SpMM graph
-            U = (D_inv_S@P).tobsr(blocksize=P.blocksize)
+                work[1] += spmm_graph_work(D_inv_S, P)  # SpMM graph
+            U = matmat(D_inv_S, P).tobsr(blocksize=P.blocksize)
 
             # Enforce U@B = 0 (1) Construct array of inv(Bi'Bi), where Bi is B
             # restricted to row i's sparsity pattern in pattern. This
@@ -229,10 +230,10 @@ def jacobi_prolongation_smoother(S, T, C, B, omega=4.0/3.0, degree=1,
         P = T
         for _ in range(degree):
             if work is not None:
-                spmm_cost = S.nnz * P.nnz // n
+                spmm_cost = spmm_work(D_inv_S, P)
                 work[0] += spmm_cost + P.nnz  # SpMM + subtraction
-                work[1] += spmm_cost  # SpMM graph
-            P = P - (D_inv_S @ P)
+                work[1] += spmm_graph_work(D_inv_S, P)  # SpMM graph
+            P = P - matmat(D_inv_S, P)
 
     return P
 
@@ -302,10 +303,10 @@ def richardson_prolongation_smoother(S, T, omega=4.0/3.0, degree=1, work=None):
     P = T
     for _ in range(degree):
         if work is not None:
-            spmm_cost = S.nnz * P.nnz // n
+            spmm_cost = spmm_work(S, P)
             work[0] += spmm_cost + 2 * P.nnz  # SpMM + scalar mul + subtraction
-            work[1] += spmm_cost  # SpMM graph
-        P = P - weight*(S@P)
+            work[1] += spmm_graph_work(S, P)  # SpMM graph
+        P = P - weight*matmat(S, P)
 
     return P
 
@@ -418,9 +419,9 @@ def cg_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter, tol,
 
     if work is not None:
         # Initial SpMM: A @ T restricted to pattern
-        spmm_cost = A.nnz * T.nnz // n
+        spmm_cost = spmm_work(A, T)
         work[0] += spmm_cost
-        work[1] += spmm_cost
+        work[1] += spmm_graph_work(A, T)
 
     # Enforce R@B = 0
     satisfy_constraints(R, B, BtBinv, work=work)
@@ -483,9 +484,9 @@ def cg_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter, tol,
                                          P.blocksize[1])
 
         if work is not None:
-            spmm_cost = A.nnz * P.nnz // n
+            spmm_cost = spmm_work(A, P)
             work[0] += spmm_cost
-            work[1] += spmm_cost
+            work[1] += spmm_graph_work(A, P)
 
         # Enforce AP@B = 0
         satisfy_constraints(AP, B, BtBinv, work=work)
@@ -502,12 +503,13 @@ def cg_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter, tol,
 
         # Ensure identity at C-pts
         if Cpt_params[0]:
-            T = Cpt_params[1]['I_F']@T + Cpt_params[1]['P_I']
+            I_F = Cpt_params[1]['I_F']
             if work is not None:
                 # SpMM + sparse addition
-                I_F = Cpt_params[1]['I_F']
-                work[0] += I_F.nnz * T.nnz // n + T.nnz
-                work[1] += I_F.nnz * T.nnz // n
+                spmm_cost = spmm_work(I_F, T)
+                work[0] += spmm_cost + T.nnz
+                work[1] += spmm_graph_work(I_F, T)
+            T = I_F@T + Cpt_params[1]['P_I']
 
         # Update residual
         R = R - alpha*AP
@@ -620,13 +622,13 @@ def cgnr_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter,
 
     if work is not None:
         # A@T SpMM
-        spmm_cost_at = A.nnz * T.nnz // n
+        spmm_cost_at = spmm_work(A, T)
         work[0] += spmm_cost_at
-        work[1] += spmm_cost_at
+        work[1] += spmm_graph_work(A, T)
         # Ah@AT SpMM (restricted to pattern)
-        spmm_cost_ah_at = Ah.nnz * AT.nnz // n
+        spmm_cost_ah_at = spmm_work(Ah, AT)
         work[0] += spmm_cost_ah_at
-        work[1] += spmm_cost_ah_at
+        work[1] += spmm_graph_work(Ah, AT)
 
     # Enforce R@B = 0
     satisfy_constraints(R, B, BtBinv, work=work)
@@ -691,13 +693,13 @@ def cgnr_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter,
 
         if work is not None:
             # A@P SpMM
-            spmm_cost_ap = A.nnz * P.nnz // n
+            spmm_cost_ap = spmm_work(A, P)
             work[0] += spmm_cost_ap
-            work[1] += spmm_cost_ap
+            work[1] += spmm_graph_work(A, P)
             # Ah@AP_temp SpMM (restricted to pattern)
-            spmm_cost_ah_ap = Ah.nnz * AP_temp.nnz // n
+            spmm_cost_ah_ap = spmm_work(Ah, AP_temp)
             work[0] += spmm_cost_ah_ap
-            work[1] += spmm_cost_ah_ap
+            work[1] += spmm_graph_work(Ah, AP_temp)
         del AP_temp
 
         # Enforce AP@B = 0
@@ -715,12 +717,13 @@ def cgnr_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter,
 
         # Ensure identity at C-pts
         if Cpt_params[0]:
-            T = Cpt_params[1]['I_F']@T + Cpt_params[1]['P_I']
+            I_F = Cpt_params[1]['I_F']
             if work is not None:
                 # SpMM + sparse addition
-                I_F = Cpt_params[1]['I_F']
-                work[0] += I_F.nnz * T.nnz // n + T.nnz
-                work[1] += I_F.nnz * T.nnz // n
+                spmm_cost = spmm_work(I_F, T)
+                work[0] += spmm_cost + T.nnz
+                work[1] += spmm_graph_work(I_F, T)
+            T = I_F@T + Cpt_params[1]['P_I']
 
         # Update residual
         R = R - alpha*AP
@@ -888,9 +891,9 @@ def gmres_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter,
 
     if work is not None:
         # Initial A@T SpMM
-        spmm_cost = A.nnz * T.nnz // n
+        spmm_cost = spmm_work(A, T)
         work[0] += spmm_cost
-        work[1] += spmm_cost
+        work[1] += spmm_graph_work(A, T)
 
     # Apply diagonal preconditioner
     if weighting in ('local', 'diagonal'):
@@ -948,9 +951,9 @@ def gmres_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter,
 
         if work is not None:
             # A@V[i] SpMM
-            spmm_cost = A.nnz * V[i].nnz // n
+            spmm_cost = spmm_work(A, V[i])
             work[0] += spmm_cost
-            work[1] += spmm_cost
+            work[1] += spmm_graph_work(A, V[i])
 
         if weighting in ('local', 'diagonal'):
             AV = scale_rows(AV, Dinv)
@@ -1042,12 +1045,13 @@ def gmres_prolongation_smoothing(A, T, B, BtBinv, pattern, maxiter,
 
     # Ensure identity at C-pts
     if Cpt_params[0]:
-        T = Cpt_params[1]['I_F']@T + Cpt_params[1]['P_I']
+        I_F = Cpt_params[1]['I_F']
         if work is not None:
             # SpMM + sparse addition
-            I_F = Cpt_params[1]['I_F']
-            work[0] += I_F.nnz * T.nnz // n + T.nnz
-            work[1] += I_F.nnz * T.nnz // n
+            spmm_cost = spmm_work(I_F, T)
+            work[0] += spmm_cost + T.nnz
+            work[1] += spmm_graph_work(I_F, T)
+        T = I_F@T + Cpt_params[1]['P_I']
 
     return T
 
@@ -1254,10 +1258,10 @@ def energy_prolongation_smoother(A, T, Atilde, B, Bf, Cpt_params,
         for _ in range(degree):
             if work is not None:
                 # SpGEMM: Atilde @ pattern
-                spmm_cost = Atilde.nnz * pattern.nnz // pattern.shape[0]
+                spmm_cost = spmm_work(AtildeCopy, pattern)
                 work[0] += spmm_cost
-                work[1] += spmm_cost
-            pattern = AtildeCopy @ pattern
+                work[1] += spmm_graph_work(AtildeCopy, pattern)
+            pattern = matmat(AtildeCopy, pattern)
 
         # Optional filtering of sparsity pattern before smoothing
         if 'theta' in prefilter and 'k' in prefilter:
@@ -1300,10 +1304,10 @@ def energy_prolongation_smoother(A, T, Atilde, B, Bf, Cpt_params,
         P_I = Cpt_params[1]['P_I']
         if work is not None:
             # SpGEMM + sparse addition
-            spmm_cost = I_F.nnz * pattern.nnz // pattern.shape[0]
+            spmm_cost = spmm_work(I_F, pattern)
             work[0] += spmm_cost + pattern.nnz
-            work[1] += spmm_cost
-        pattern = I_F @ pattern
+            work[1] += spmm_graph_work(I_F, pattern)
+        pattern = matmat(I_F, pattern)
         pattern = P_I + pattern
 
     # Construct array of inv(Bi'Bi), where Bi is B restricted to row i's
@@ -1320,10 +1324,10 @@ def energy_prolongation_smoother(A, T, Atilde, B, Bf, Cpt_params,
         # Ensure identity at C-pts
         if Cpt_params[0]:
             if work is not None:
-                spmm_cost = I_F.nnz * T.nnz // n
+                spmm_cost = spmm_work(I_F, T)
                 work[0] += spmm_cost + T.nnz
-                work[1] += spmm_cost
-            T = Cpt_params[1]['I_F']@T + Cpt_params[1]['P_I']
+                work[1] += spmm_graph_work(I_F, T)
+            T = I_F@T + Cpt_params[1]['P_I']
 
     # Iteratively minimize the energy of T subject to the constraints of
     # pattern and maintaining T's effect on B, i.e. T@B =

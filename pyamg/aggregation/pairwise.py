@@ -7,7 +7,9 @@ from scipy.sparse import csr_array, issparse, SparseEfficiencyWarning
 
 from pyamg.multilevel import MultilevelSolver
 from pyamg.relaxation.smoothing import change_smoothers
-from pyamg.util.utils import get_blocksize, levelize_strength_or_aggregation, asfptype
+from pyamg.util.utils import get_blocksize, levelize_strength_or_aggregation, asfptype, \
+    spmm_work, spmm_graph_work
+from pyamg.util.sparse_blas import rap_counted, rap_compatible as _rap_ok
 from .aggregate import pairwise_aggregation
 
 
@@ -153,10 +155,16 @@ def _extend_hierarchy(levels, aggregate, work):
     levels[-1].P = P  # unsmoothed prolongator
     levels[-1].R = R  # restriction operator
 
-    # RAP triple product: two SpGEMMs
+    # RAP triple product. Fused threaded kernel handles CSR and
+    # square-block BSR with matching block sizes.
     levels.append(MultilevelSolver.Level())
-    rap_cost = R.nnz * A.nnz // n + A.nnz * P.nnz // n
-    work[0] += rap_cost  # numerical
-    work[1] += rap_cost  # graph
-    A = R @ A @ P
+    if _rap_ok(R, A, P):
+        A, fma, graph = rap_counted(R, A, P)
+    else:
+        RA = R @ A
+        fma = spmm_work(R, A) + spmm_work(RA, P)
+        graph = spmm_graph_work(R, A) + spmm_graph_work(RA, P)
+        A = RA @ P
+    work[0] += fma    # numerical
+    work[1] += graph  # graph
     levels[-1].A = A

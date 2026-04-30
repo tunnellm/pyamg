@@ -7,6 +7,8 @@ from scipy import sparse
 from .. import amg_core
 from ..graph import lloyd_cluster, balanced_lloyd_cluster, metis_partition
 from ..strength import classical_strength_of_connection
+from ..util.utils import spmm_work, spmm_graph_work
+from ..util.sparse_blas import rap_counted, rap_compatible as _rap_ok
 
 
 def standard_aggregation(C, work=None):
@@ -336,21 +338,26 @@ def pairwise_aggregation(A, matchings=2, theta=0.25,
         if num_aggregates == 0:
             break
 
-        # Form coarse grid operator for next matching
+        # Form coarse grid operator for next matching: fused kernel for CSR,
+        # scipy two-step otherwise.
         if i < (matchings-1):
             if sparse.issparse(T_temp) and T_temp.format == 'csr':
                 R = T_temp.T.tocsr()
-                Ac = R @ Ac @ T_temp
             else:
                 R = T_temp.T
-                Ac = R @ Ac @ T_temp
-
-            # RAP work: nnz(R)*nnz(Ac)/n + nnz(Ac)*nnz(T_temp)/n for numerical and graph
-            if work is not None:
-                n_mid = Ac.shape[0]
-                rap_cost = (R.nnz * Ac.nnz + Ac.nnz * T_temp.nnz) // n_mid
-                work[0] += rap_cost
-                work[1] += rap_cost
+            if _rap_ok(R, Ac, T_temp):
+                if work is not None:
+                    Ac, fma, graph = rap_counted(R, Ac, T_temp)
+                    work[0] += fma
+                    work[1] += graph
+                else:
+                    Ac, _, _ = rap_counted(R, Ac, T_temp)
+            else:
+                RA = R @ Ac
+                if work is not None:
+                    work[0] += spmm_work(R, Ac) + spmm_work(RA, T_temp)
+                    work[1] += spmm_graph_work(R, Ac) + spmm_graph_work(RA, T_temp)
+                Ac = RA @ T_temp
 
     # Convert T to dtype int if only used for aggregation
     if compute_P:

@@ -8,7 +8,9 @@ from scipy.sparse import csr_array, issparse, SparseEfficiencyWarning
 from pyamg.multilevel import MultilevelSolver
 from pyamg.relaxation.smoothing import change_smoothers
 from pyamg.util.utils import eliminate_diag_dom_nodes, get_blocksize, asfptype, \
-    levelize_strength_or_aggregation, levelize_smooth_or_improve_candidates
+    levelize_strength_or_aggregation, levelize_smooth_or_improve_candidates, \
+    spmm_work, spmm_graph_work
+from pyamg.util.sparse_blas import rap_counted, rap_compatible as _rap_ok
 from pyamg.strength import classical_strength_of_connection, \
     symmetric_strength_of_connection, evolution_strength_of_connection, \
     energy_based_strength_of_connection, distance_strength_of_connection, \
@@ -451,14 +453,19 @@ def _extend_hierarchy(levels, strength, aggregate, smooth, improve_candidates,
     levels[-1].P = P  # smoothed prolongator
     levels[-1].R = R  # restriction operator
 
-    # RAP (Galerkin triple product): Two SpGEMMs with equal graph and numerical cost.
-    # Approximates sparse mat-mat A @ B as nnz(A) * avg_nnz_per_row(B).
-    rap_cost = R.nnz * A.nnz // A.shape[0] + A.nnz * P.nnz // P.shape[0]
-    work[0] += rap_cost  # numerical
-    work[1] += rap_cost  # graph
-
+    # RAP (Galerkin triple product). Fused threaded kernel handles CSR and
+    # square-block BSR with matching block sizes; other format mixes fall
+    # back to scipy two-step.
     levels.append(MultilevelSolver.Level())
-    A = R @ A @ P              # Galerkin operator
+    if _rap_ok(R, A, P):
+        A, fma, graph = rap_counted(R, A, P)
+    else:
+        RA = R @ A
+        fma = spmm_work(R, A) + spmm_work(RA, P)
+        graph = spmm_graph_work(R, A) + spmm_graph_work(RA, P)
+        A = RA @ P             # Galerkin operator
+    work[0] += fma    # numerical
+    work[1] += graph  # graph
     A.symmetry = symmetry
     levels[-1].A = A
     levels[-1].B = B           # right near nullspace candidates

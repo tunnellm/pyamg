@@ -16,6 +16,7 @@ from .classical import ruge_stuben_solver, air_solver
 from .aggregation import smoothed_aggregation_solver, rootnode_solver, pairwise_solver, adaptive_sa_solver
 from .gallery import demo
 from .blackbox import solve, solver, solver_configuration
+from .util.sparse_blas import set_num_threads, get_num_threads, has_openmp
 
 __all__ = [
     'MultilevelSolver',
@@ -29,8 +30,10 @@ __all__ = [
     'coarse_grid_solver',
     'demo',
     'gallery',
+    'get_num_threads',
     'graph',
     'graph_ref',
+    'has_openmp',
     'krylov',
     'multilevel',
     'multilevel_solver',
@@ -38,6 +41,7 @@ __all__ = [
     'relaxation',
     'rootnode_solver',
     'ruge_stuben_solver',
+    'set_num_threads',
     'smoothed_aggregation_solver',
     'solve',
     'solver',

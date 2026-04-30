@@ -48,6 +48,101 @@ def get_blocksize(A):
     return 1
 
 
+def spmm_work(A, B):
+    """Scalar FMA count for sparse matrix-matrix product C = A @ B.
+
+    Counts the number of scalar fused multiply-accumulate operations performed
+    by the standard row-wise (Gustavson) SpGEMM algorithm:
+
+        sum_{(i, j) nonzero in A} nnz(B[j, :])
+            = sum_j nnz(A[:, j]) * nnz(B[j, :])
+
+    For BSR inputs with A.blocksize == (r, c) and B.blocksize == (c, k), each
+    block-block multiply contributes r * c * k scalar FMAs.
+
+    Parameters
+    ----------
+    A, B : sparse matrices in CSR, CSC, or BSR format
+        Inner dimensions must be compatible (A.shape[1] == B.shape[0]).
+
+    Returns
+    -------
+    int
+        Exact scalar FMA count. Returns 0 if A or B has no nonzeros.
+
+    Notes
+    -----
+    This is exact for the algorithm scipy uses; it replaces the prior
+    approximation `nnz(A) * nnz(B) // n`, which assumed a uniform row
+    distribution and badly underestimated cost on post-aggregation matrices.
+    """
+    if A.nnz == 0 or B.nnz == 0:
+        return 0
+
+    # Pure BSR @ BSR: count in block units (cheap), then scale by block FMAs.
+    if A.format == 'bsr' and B.format == 'bsr':
+        block_inter = int((B.indptr[A.indices + 1] - B.indptr[A.indices]).sum())
+        r, c = A.blocksize
+        _, k = B.blocksize
+        return block_inter * r * c * k
+
+    # Mixed CSR/CSC/BSR: unroll any BSR operand to scalar so the inner index
+    # has the same unit on both sides. Then use the symmetric form
+    #   sum_j nnz(A[:, j]) * nnz(B[j, :])
+    # which is format-agnostic.
+    if A.format == 'bsr':
+        A = A.tocsr()
+    if B.format == 'bsr':
+        B = B.tocsr()
+
+    inner = A.shape[1]
+
+    if A.format == 'csc':
+        a_col_nnz = A.indptr[1:] - A.indptr[:-1]
+    elif A.format == 'csr':
+        a_col_nnz = np.bincount(A.indices, minlength=inner)
+    else:
+        a_col_nnz = np.bincount(A.tocsr().indices, minlength=inner)
+
+    if B.format == 'csr':
+        b_row_nnz = B.indptr[1:] - B.indptr[:-1]
+    elif B.format == 'csc':
+        b_row_nnz = np.bincount(B.indices, minlength=inner)
+    else:
+        b_row_nnz = B.tocsr().indptr[1:] - B.tocsr().indptr[:-1]
+
+    return int(np.dot(a_col_nnz, b_row_nnz))
+
+
+def spmm_graph_work(A, B):
+    """Pattern (graph) work for sparse matrix-matrix product C = A @ B.
+
+    Counts the number of fused-triple SPA fills performed by the row-wise
+    Gustavson algorithm — one per nonzero (i, j, k) triple at the storage
+    granularity. For CSR, equals scalar FMA count (= ``spmm_work``). For
+    BSR with block sizes (r, c) and (c, k), equals ``spmm_work / (r*c*k)``,
+    i.e. the number of *block* triples.
+
+    Parameters
+    ----------
+    A, B : sparse matrices in CSR, CSC, or BSR format
+        Inner dimensions must be compatible (A.shape[1] == B.shape[0]).
+
+    Returns
+    -------
+    int
+        Block-pattern fill count. Returns 0 if A or B has no nonzeros.
+    """
+    if A.nnz == 0 or B.nnz == 0:
+        return 0
+
+    if A.format == 'bsr' and B.format == 'bsr':
+        return int((B.indptr[A.indices + 1] - B.indptr[A.indices]).sum())
+
+    # CSR / CSC / mixed: graph work equals FMA count (block size = 1).
+    return spmm_work(A, B)
+
+
 def profile_solver(ml, accel=None, **kwargs):
     """Profile a particular multilevel object.
 
@@ -1256,6 +1351,8 @@ def filter_operator(A, C, B, Bf, BtBinv=None, work=None):
         A = A.tobsr((rows_per_block, cols_per_block))
     else:
         A = A.tocsr()
+    # eliminate redundant zeros created by the above (upstream 9f8299bc)
+    A.sum_duplicates()
 
     # Calculate difference between A @ B and Bf
     diff = A @ B - Bf

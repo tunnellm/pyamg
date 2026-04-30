@@ -14,7 +14,8 @@ from pyamg.strength import classical_strength_of_connection, \
 from pyamg.classical.interpolate import direct_interpolation, classical_interpolation
 from . import split
 from .cr import CR
-from ..util.utils import asfptype
+from ..util.utils import asfptype, spmm_work, spmm_graph_work
+from ..util.sparse_blas import rap_counted, rap_compatible as _rap_ok
 
 
 def ruge_stuben_solver(A,
@@ -252,14 +253,17 @@ def _extend_hierarchy(levels, strength, CF, interpolation, keep, work=None):
     levels[-1].P = P                               # prolongation operator
     levels[-1].R = R                               # restriction operator
 
-    # RAP (Galerkin triple product): Two SpGEMMs with equal graph and numerical cost.
-    # Approximates sparse mat-mat A @ B as nnz(A) * avg_nnz_per_row(B).
-    rap_cost = R.nnz * A.nnz // A.shape[0] + A.nnz * P.nnz // P.shape[0]
-    work[0] += rap_cost  # numerical
-    work[1] += rap_cost  # graph
-
-    # Form next level through Galerkin product
+    # Fused RAP via the threaded kernel; rap_counted returns the exact FMA
+    # count (== spmm_work(R,A) + spmm_work(RA,P)) without materializing RA.
     levels.append(MultilevelSolver.Level())
-    A = R @ A @ P
+    if _rap_ok(R, A, P):
+        A, fma, graph = rap_counted(R, A, P)
+    else:
+        RA = R @ A
+        fma = spmm_work(R, A) + spmm_work(RA, P)
+        graph = spmm_graph_work(R, A) + spmm_graph_work(RA, P)
+        A = RA @ P
+    work[0] += fma    # numerical
+    work[1] += graph  # graph
     levels[-1].A = A
     return False

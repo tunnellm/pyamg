@@ -11,7 +11,8 @@ from ..strength import symmetric_strength_of_connection, \
 from ..krylov import gmres
 from ..util.linalg import norm, approximate_spectral_radius
 from ..util.utils import amalgamate, levelize_strength_or_aggregation, \
-    levelize_smooth_or_improve_candidates, asfptype
+    levelize_smooth_or_improve_candidates, asfptype, spmm_work, spmm_graph_work
+from ..util.sparse_blas import rap_counted, rap_compatible as _rap_ok
 from ..relaxation.smoothing import change_smoothers, rho_D_inv_A
 from ..relaxation.relaxation import gauss_seidel, gauss_seidel_nr, \
     gauss_seidel_ne, gauss_seidel_indexed, jacobi, polynomial
@@ -569,16 +570,22 @@ def initial_setup_stage(A, symmetry, pdef, candidate_iters, epsilon,
             raise ValueError(f'Unrecognized prolongation smoother method: {fn!s}')
 
         # R should reflect A's structure # step 4e
-        # RAP work: Two SpGEMMs. R.nnz = P_l.nnz for transpose.
-        rap_cost = P_l.nnz * A_l.nnz // A_l.shape[0] + A_l.nnz * P_l.nnz // P_l.shape[0]
-        work[0] += rap_cost  # numerical
-        work[1] += rap_cost  # graph
+        # RAP triple product: fused kernel for CSR, scipy two-step otherwise.
         if symmetry == 'symmetric':
-            A_l = P_l.T.asformat(P_l.format) @ A_l @ P_l
+            R_l = P_l.T.asformat(P_l.format)
         elif symmetry == 'hermitian':
-            A_l = P_l.T.conjugate().asformat(P_l.format) @ A_l @ P_l
+            R_l = P_l.T.conjugate().asformat(P_l.format)
         else:
             raise ValueError(f'aSA not implemented for symmetry={symmetry}.')
+        if _rap_ok(R_l, A_l, P_l):
+            A_l, fma, graph = rap_counted(R_l, A_l, P_l)
+        else:
+            RA = R_l @ A_l
+            fma = spmm_work(R_l, A_l) + spmm_work(RA, P_l)
+            graph = spmm_graph_work(R_l, A_l) + spmm_graph_work(RA, P_l)
+            A_l = RA @ P_l
+        work[0] += fma    # numerical
+        work[1] += graph  # graph
 
         StrengthOps.append(C_l)
         AggOps.append(AggOp)
@@ -765,13 +772,17 @@ def general_setup_stage(ml, symmetry, candidate_iters, prepostsmoother,
         elif symmetry == 'hermitian':
             levels[i].R = levels[i].P.T.conjugate().asformat(levels[i].P.format)
 
-        # construct coarse A
-        # RAP work: Two SpGEMMs
+        # construct coarse A: fused kernel for CSR/BSR, scipy two-step otherwise.
         R_i, A_i, P_i = levels[i].R, levels[i].A, levels[i].P
-        rap_cost = R_i.nnz * A_i.nnz // A_i.shape[0] + A_i.nnz * P_i.nnz // P_i.shape[0]
-        work[0] += rap_cost  # numerical
-        work[1] += rap_cost  # graph
-        levels[i+1].A = R_i @ A_i @ P_i
+        if _rap_ok(R_i, A_i, P_i):
+            levels[i+1].A, fma, graph = rap_counted(R_i, A_i, P_i)
+        else:
+            RA = R_i @ A_i
+            fma = spmm_work(R_i, A_i) + spmm_work(RA, P_i)
+            graph = spmm_graph_work(R_i, A_i) + spmm_graph_work(RA, P_i)
+            levels[i+1].A = RA @ P_i
+        work[0] += fma    # numerical
+        work[1] += graph  # graph
 
         # construct bridging P
         T_bridge = make_bridge(levels[i+1].T)

@@ -10,6 +10,7 @@ import numpy as np
 from . import krylov
 from .util.utils import to_type
 from .util.params import set_tol
+from .util.sparse_blas import matvec as _matvec, serial_blas as _serial_blas
 from .relaxation import smoothing
 from .util import upcast
 
@@ -705,6 +706,22 @@ class MultilevelSolver:
               callback=None, residuals=None, cycles_per_level=1, return_info=False):
         """Execute multigrid cycling.
 
+        BLAS thread-pool note: this method runs its body inside
+        :func:`pyamg.util.sparse_blas.serial_blas`, which restricts
+        numpy/scipy BLAS to one thread for the duration of the solve to
+        avoid oversubscribing cores when pyamg's OpenMP is active.
+        BLAS threading is restored on return."""
+        with _serial_blas():
+            return self._solve_impl(
+                b, x0=x0, tol=tol, maxiter=maxiter, cycle=cycle, accel=accel,
+                callback=callback, residuals=residuals,
+                cycles_per_level=cycles_per_level, return_info=return_info,
+            )
+
+    def _solve_impl(self, b, x0=None, tol=1e-5, maxiter=100, cycle='V', accel=None,
+                    callback=None, residuals=None, cycles_per_level=1, return_info=False):
+        """Internal multigrid cycling. See :meth:`solve` for parameters.
+
         Parameters
         ----------
         b : array
@@ -818,13 +835,13 @@ class MultilevelSolver:
                 # history is desired
 
                 if residuals is not None:
-                    residuals[:] = [np.linalg.norm(b - A @ x)]
+                    residuals[:] = [np.linalg.norm(b - _matvec(A, x))]
 
                     def callback_wrapper(x):
                         if np.isscalar(x):
                             residuals.append(x)
                         else:
-                            residuals.append(np.linalg.norm(b - A @ x))
+                            residuals.append(np.linalg.norm(b - _matvec(A, x)))
                         if callback is not None:
                             callback(x)
                 else:
@@ -848,7 +865,7 @@ class MultilevelSolver:
                 normb = 1.0  # set so that we have an absolute tolerance
 
         # Start cycling (no acceleration)
-        normr = np.linalg.norm(b - A @ x)
+        normr = np.linalg.norm(b - _matvec(A, x))
         if residuals is not None:
             residuals[:] = [normr]  # initial residual
 
@@ -870,7 +887,7 @@ class MultilevelSolver:
 
             it += 1
 
-            normr = np.linalg.norm(b - A @ x)
+            normr = np.linalg.norm(b - _matvec(A, x))
             if residuals is not None:
                 residuals.append(normr)
 
@@ -924,9 +941,9 @@ class MultilevelSolver:
 
         self.levels[lvl].presmoother(A, x, b)
 
-        residual = b - A @ x
+        residual = b - _matvec(A, x)
 
-        coarse_b = self.levels[lvl].R @ residual
+        coarse_b = _matvec(self.levels[lvl].R, residual)
         coarse_x = np.zeros_like(coarse_b)
 
         flops = 0  # accumulated for K-cycle; 0 for fixed cycles
@@ -961,12 +978,12 @@ class MultilevelSolver:
 
                 # Orthogonalize new search direction to old directions
                 for j in range(k):  # loops from j = 0...(k-1)
-                    beta[k, j] = np.inner(p[j, :].conj(), Ac @ p[k, :]) /\
-                            np.inner(p[j, :].conj(), Ac @ p[j, :])
+                    beta[k, j] = np.inner(p[j, :].conj(), _matvec(Ac, p[k, :])) /\
+                            np.inner(p[j, :].conj(), _matvec(Ac, p[j, :]))
                     p[k, :] -= beta[k, j] * p[j, :]
 
                 # Compute step size
-                Ap = Ac @ p[k, :]
+                Ap = _matvec(Ac, p[k, :])
                 alpha = np.inner(p[k, :].conj(), np.ravel(coarse_b)) /\
                         np.inner(p[k, :].conj(), Ap)
 
@@ -1006,7 +1023,7 @@ class MultilevelSolver:
             level_cost += self.__solve(lvl + 1, w, r, 'K')
 
             d = w.copy()
-            Ad = Ac @ d                         # 1 SpMV
+            Ad = _matvec(Ac, d)                 # 1 SpMV
             level_cost += Ac.nnz
             dAd = np.inner(d.conj(), Ad)
             alpha = np.inner(d.conj(), r) / dAd
@@ -1032,7 +1049,7 @@ class MultilevelSolver:
                 level_cost += 2 * n_c           # 1 dot + 1 axpy
 
                 # Step size and update
-                Ad = Ac @ d                     # 1 SpMV
+                Ad = _matvec(Ac, d)             # 1 SpMV
                 level_cost += Ac.nnz
                 dAd = np.inner(d.conj(), Ad)
                 alpha = np.inner(d.conj(), r) / dAd
@@ -1044,7 +1061,7 @@ class MultilevelSolver:
         else:
             raise TypeError(f'Unrecognized cycle type ({cycle})')
 
-        x += self.levels[lvl].P @ coarse_x   # coarse grid correction
+        x += _matvec(self.levels[lvl].P, coarse_x)   # coarse grid correction
 
         self.levels[lvl].postsmoother(A, x, b)
 

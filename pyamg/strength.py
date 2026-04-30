@@ -16,8 +16,10 @@ from scipy import sparse
 from . import amg_core
 from .relaxation.relaxation import jacobi
 from .util.linalg import approximate_spectral_radius
+from .util.sparse_blas import matmat
 from .util.utils import (scale_rows_by_largest_entry, amalgamate, scale_rows,
-                         get_block_diag, scale_columns)
+                         get_block_diag, scale_columns, spmm_work,
+                         spmm_graph_work)
 from .util.params import set_tol
 
 
@@ -504,12 +506,12 @@ def energy_based_strength_of_connection(A, theta=0.0, k=2, work=None):
             work[0] += n  # numerical: omega * diagonal
         else:
             # SpMM: A @ S where S has nnz_S entries
-            spmm_cost = nnz_A * nnz_S // n
+            spmm_cost = spmm_work(A, S)
             work[0] += spmm_cost  # numerical
-            work[1] += spmm_cost  # graph
+            work[1] += spmm_graph_work(A, S)  # graph
             # Sparse ops: subtract + diag_scale + scalar_mul + add
             work[0] += 4 * nnz_S
-        S = S + omega * (Dinv @ (Id - A @ S))
+        S = S + omega * (Dinv @ (Id - matmat(A, S)))
 
     # Calculate the strength entries in S column-wise, but only strength
     # values at the sparsity pattern of A
@@ -743,21 +745,19 @@ def evolution_strength_of_connection(A, B=None, epsilon=4.0, k=2,
 
         # Calculate (Atilde^nsquare)^T = (Atilde^T)^nsquare
         for _i in range(nsquare):
-            # Work: SpMM cost = nnz(A) * nnz(B) / n
             if work is not None:
-                spmm_cost = Atilde.nnz * Atilde.nnz // dimen
+                spmm_cost = spmm_work(Atilde, Atilde)
                 work[0] += spmm_cost
-                work[1] += spmm_cost
-            Atilde = Atilde @ Atilde
+                work[1] += spmm_graph_work(Atilde, Atilde)
+            Atilde = matmat(Atilde, Atilde)
 
         JacobiStep = (Id - (1.0 / rho_DinvA) @ Dinv_A).T.tocsr()
         for _i in range(ninc):
-            # Work: SpMM cost
             if work is not None:
-                spmm_cost = Atilde.nnz * JacobiStep.nnz // dimen
+                spmm_cost = spmm_work(Atilde, JacobiStep)
                 work[0] += spmm_cost
-                work[1] += spmm_cost
-            Atilde = Atilde @ JacobiStep
+                work[1] += spmm_graph_work(Atilde, JacobiStep)
+            Atilde = matmat(Atilde, JacobiStep)
         del JacobiStep
 
         # Apply mask to Atilde, zeros in mask have already been eliminated at
@@ -780,12 +780,11 @@ def evolution_strength_of_connection(A, B=None, epsilon=4.0, k=2,
         # Use computational short-cut for case (ninc == 0) and (nsquare > 0)
         # Calculate Atilde^k only at the sparsity pattern of mask.
         for _i in range(nsquare - 1):
-            # Work: SpMM cost
             if work is not None:
-                spmm_cost = Atilde.nnz * Atilde.nnz // dimen
+                spmm_cost = spmm_work(Atilde, Atilde)
                 work[0] += spmm_cost
-                work[1] += spmm_cost
-            Atilde = Atilde @ Atilde
+                work[1] += spmm_graph_work(Atilde, Atilde)
+            Atilde = matmat(Atilde, Atilde)
 
         # Call incomplete mat-mat mult
         AtildeCSC = Atilde.tocsc()
@@ -797,9 +796,12 @@ def evolution_strength_of_connection(A, B=None, epsilon=4.0, k=2,
                                          AtildeCSC.indices, AtildeCSC.data,
                                          mask.indptr, mask.indices, mask.data,
                                          dimen)
-        # Work: incomplete SpMM at mask pattern + tocsc conversion
+        # Work: incomplete SpMM at mask pattern + tocsc conversion.
+        # Upper-bound by the full Atilde @ AtildeCSC FMA count; the kernel
+        # only realizes outputs at mask, so this overestimates when mask is
+        # sparser than the natural SpMM fill.
         if work is not None:
-            incomplete_cost = mask.nnz * Atilde.nnz // dimen
+            incomplete_cost = spmm_work(Atilde, AtildeCSC)
             work[0] += incomplete_cost
             work[1] += incomplete_cost + Atilde.nnz  # +nnz for tocsc
 
