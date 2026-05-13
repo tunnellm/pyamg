@@ -10,7 +10,8 @@ from pyamg.relaxation.smoothing import change_smoothers
 from pyamg.util.utils import eliminate_diag_dom_nodes, get_blocksize, asfptype, \
     levelize_strength_or_aggregation, levelize_smooth_or_improve_candidates, \
     spmm_work, spmm_graph_work
-from pyamg.util.sparse_blas import rap_counted, rap_compatible as _rap_ok
+from pyamg.util.sparse_blas import rap_counted, rap_compatible as _rap_ok, \
+    with_serial_blas as _with_serial_blas
 from pyamg.strength import classical_strength_of_connection, \
     symmetric_strength_of_connection, evolution_strength_of_connection, \
     energy_based_strength_of_connection, distance_strength_of_connection, \
@@ -25,6 +26,7 @@ from .smooth import jacobi_prolongation_smoother, \
 from ..relaxation.utils import relaxation_as_linear_operator
 
 
+@_with_serial_blas
 def smoothed_aggregation_solver(A, B=None, BH=None,
                                 symmetry='hermitian', strength='symmetric',
                                 aggregate='standard',

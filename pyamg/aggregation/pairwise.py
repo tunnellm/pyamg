@@ -9,10 +9,12 @@ from pyamg.multilevel import MultilevelSolver
 from pyamg.relaxation.smoothing import change_smoothers
 from pyamg.util.utils import get_blocksize, levelize_strength_or_aggregation, asfptype, \
     spmm_work, spmm_graph_work
-from pyamg.util.sparse_blas import rap_counted, rap_compatible as _rap_ok
+from pyamg.util.sparse_blas import rap_counted, rap_compatible as _rap_ok, \
+    with_serial_blas as _with_serial_blas
 from .aggregate import pairwise_aggregation
 
 
+@_with_serial_blas
 def pairwise_solver(A,
                     aggregate=('pairwise', {'theta': 0.25,
                                'norm': 'min', 'matchings': 2}),

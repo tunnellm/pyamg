@@ -12,7 +12,8 @@ from ..util.utils import scale_T, get_Cpt_params, \
     eliminate_diag_dom_nodes, get_blocksize, \
     levelize_strength_or_aggregation, asfptype, \
     levelize_smooth_or_improve_candidates, spmm_work, spmm_graph_work
-from ..util.sparse_blas import rap_counted, rap_compatible as _rap_ok
+from ..util.sparse_blas import rap_counted, rap_compatible as _rap_ok, \
+    with_serial_blas as _with_serial_blas
 from ..strength import classical_strength_of_connection, \
     symmetric_strength_of_connection, evolution_strength_of_connection, \
     energy_based_strength_of_connection, distance_strength_of_connection, \
@@ -23,6 +24,7 @@ from .tentative import fit_candidates
 from .smooth import energy_prolongation_smoother
 
 
+@_with_serial_blas
 def rootnode_solver(A, B=None, BH=None,
                     symmetry='hermitian', strength='symmetric',
                     aggregate='standard', smooth='energy',
