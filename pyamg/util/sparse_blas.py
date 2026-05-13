@@ -14,6 +14,7 @@ own thread pool that competes with pyamg's OpenMP for cores.
 """
 
 import contextlib
+import functools
 from warnings import warn
 
 import numpy as np
@@ -91,6 +92,24 @@ def serial_blas():
             )
             _warned_no_threadpoolctl = True
         yield
+
+
+def with_serial_blas(fn):
+    """Decorator: run ``fn`` inside :func:`serial_blas`.
+
+    Wraps the decorated function so that all BLAS calls made during its
+    execution are pinned to a single thread. Used to wrap setup-phase
+    entry points (solver constructors, hierarchy builders) that mix
+    pyamg's OpenMP-threaded kernels with scipy/numpy operations whose
+    threaded BLAS would otherwise oversubscribe cores.
+
+    Nesting is safe (threadpoolctl handles re-entrancy).
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with serial_blas():
+            return fn(*args, **kwargs)
+    return wrapper
 
 
 def _index_array(arr):

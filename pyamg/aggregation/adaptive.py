@@ -13,7 +13,8 @@ from ..util.linalg import norm, approximate_spectral_radius
 from ..util.utils import amalgamate, levelize_strength_or_aggregation, \
     levelize_smooth_or_improve_candidates, asfptype
 from ..relaxation.smoothing import change_smoothers, rho_D_inv_A
-from ..util.sparse_blas import rap as _rap, rap_compatible as _rap_ok
+from ..util.sparse_blas import rap as _rap, rap_compatible as _rap_ok, \
+    with_serial_blas as _with_serial_blas
 from ..relaxation.relaxation import gauss_seidel, gauss_seidel_nr, \
     gauss_seidel_ne, gauss_seidel_indexed, jacobi, polynomial
 from .aggregation import smoothed_aggregation_solver
@@ -115,6 +116,7 @@ def unpack_arg(v):
     return v, {}
 
 
+@_with_serial_blas
 def adaptive_sa_solver(A, initial_candidates=None, symmetry='hermitian',
                        pdef=True, num_candidates=1, candidate_iters=5,
                        improvement_iters=0, epsilon=0.1,

@@ -17,13 +17,15 @@ from .aggregate import standard_aggregation, naive_aggregation,\
     lloyd_aggregation, balanced_lloyd_aggregation,\
     metis_aggregation, pairwise_aggregation
 from .tentative import fit_candidates
-from ..util.sparse_blas import rap as _rap, rap_compatible as _rap_ok
+from ..util.sparse_blas import rap as _rap, rap_compatible as _rap_ok, \
+    with_serial_blas as _with_serial_blas
 from .smooth import jacobi_prolongation_smoother, \
     richardson_prolongation_smoother, energy_prolongation_smoother
 
 from ..relaxation.utils import relaxation_as_linear_operator
 
 
+@_with_serial_blas
 def smoothed_aggregation_solver(A, B=None, BH=None,
                                 symmetry='hermitian', strength='symmetric',
                                 aggregate='standard',

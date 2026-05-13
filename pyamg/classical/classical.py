@@ -15,9 +15,11 @@ from pyamg.classical.interpolate import direct_interpolation, classical_interpol
 from . import split
 from .cr import CR
 from ..util.utils import asfptype
-from ..util.sparse_blas import rap as _rap, rap_compatible as _rap_ok
+from ..util.sparse_blas import rap as _rap, rap_compatible as _rap_ok, \
+    with_serial_blas as _with_serial_blas
 
 
+@_with_serial_blas
 def ruge_stuben_solver(A,
                        strength=('classical', {'theta': 0.25}),
                        CF=('RS', {'second_pass': False}),

@@ -20,9 +20,11 @@ from .aggregate import standard_aggregation, naive_aggregation, \
     lloyd_aggregation, pairwise_aggregation
 from .tentative import fit_candidates
 from .smooth import energy_prolongation_smoother
-from ..util.sparse_blas import rap as _rap, rap_compatible as _rap_ok
+from ..util.sparse_blas import rap as _rap, rap_compatible as _rap_ok, \
+    with_serial_blas as _with_serial_blas
 
 
+@_with_serial_blas
 def rootnode_solver(A, B=None, BH=None,
                     symmetry='hermitian', strength='symmetric',
                     aggregate='standard', smooth='energy',
