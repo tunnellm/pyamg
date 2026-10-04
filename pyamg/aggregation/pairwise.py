@@ -7,6 +7,7 @@ from scipy.sparse import csr_array, issparse, SparseEfficiencyWarning
 
 from pyamg.multilevel import MultilevelSolver
 from pyamg.relaxation.smoothing import change_smoothers
+from pyamg.util.setup_work import SetupWork
 from pyamg.util.utils import get_blocksize, levelize_strength_or_aggregation, asfptype, \
     spmm_work, spmm_graph_work
 from pyamg.util.sparse_blas import rap_counted, rap_compatible as _rap_ok, \
@@ -109,7 +110,7 @@ def pairwise_solver(A,
         raise ValueError('Pairwise solver not verified for complex matrices')
 
     # Track work: [numerical_work, graph_work]
-    work = [0, 0]
+    work = SetupWork()
 
     # Levelize the user parameters, so that they become lists describing the
     # desired user option on each level.
@@ -126,6 +127,7 @@ def pairwise_solver(A,
         _extend_hierarchy(levels, aggregate, work)
 
     ml = MultilevelSolver(levels, **kwargs)
+    ml.record_hierarchy_setup(work)
     change_smoothers(ml, presmoother, postsmoother, work=work)
     ml._setup_work = tuple(work)
     return ml

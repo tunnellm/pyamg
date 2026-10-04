@@ -193,6 +193,14 @@ def change_smoothers(ml, presmoother, postsmoother, work=None):
         raise ValueError('Unrecognized postsmoother -- use a string:\n '
                          '"method" or ("method", opts) or list thereof.')
 
+    # Keep configuration costs independent of cache/history and of hierarchy work.
+    from ..util.setup_work import SetupWork
+    outer_work = work
+    work = SetupWork(
+        SetupWork.key(level.A, name)
+        for level, names in zip(ml.levels[:-1], getattr(ml, '_hierarchy_setup_dependencies', ()))
+        for name in names)
+
     # Functions that accept work parameter for spectral radius counting
     work_funcs = {'jacobi', 'block_jacobi', 'richardson', 'chebyshev',
                   'jacobi_ne', 'schwarz', 'strength_based_schwarz',
@@ -380,6 +388,14 @@ def change_smoothers(ml, presmoother, postsmoother, work=None):
         ml.levels[i].presmoother = setup_presmoother(ml.levels[i], **_add_work(fn1, kwargs1))
         ml.levels[i].postsmoother = setup_postsmoother(ml.levels[i], **_add_work(fn2, kwargs2))
 
+    ml._smoother_setup_work = tuple(work)
+    if outer_work is not None:
+        outer_work[0] += work[0]
+        outer_work[1] += work[1]
+    # K-cycle costs are cached separately from cycle_complexity().
+    if hasattr(ml, '_k_level_costs'):
+        del ml._k_level_costs
+
 
 def rho_D_inv_A(A, work=None):
     """Return the (approx.) spectral radius of D^-1 @ A.
@@ -406,15 +422,20 @@ def rho_D_inv_A(A, work=None):
     1.0
 
     """
+    from ..util.setup_work import SetupWork
+    logical = isinstance(work, SetupWork)
     if not hasattr(A, 'rho_D_inv'):
         D_inv = get_diagonal(A, inv=True)
         D_inv_A = scale_rows(A, D_inv, copy=True)
-        A.rho_D_inv = approximate_spectral_radius(D_inv_A, work=work)
+        A.rho_D_inv = approximate_spectral_radius(D_inv_A, work=None if logical else work)
         A.rho_D_inv_matvecs = getattr(D_inv_A, 'rho_matvecs', 0)
         # Work: get_diagonal (nnz/2 search) + scale_rows (nnz muls)
-        if work is not None:
+        if work is not None and not logical:
             work[0] += A.nnz  # scale_rows numerical
             work[1] += A.nnz // 2  # diagonal extraction graph
+
+    if logical:
+        work.charge(A, 'rho_D_inv', (1 + A.rho_D_inv_matvecs) * A.nnz, A.nnz // 2)
 
     return A.rho_D_inv
 

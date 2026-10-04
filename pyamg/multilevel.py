@@ -550,6 +550,33 @@ class MultilevelSolver:
         return sum(level.A.shape[0] for level in self.levels) /\
             float(self.levels[0].A.shape[0])
 
+    def record_hierarchy_setup(self, work):
+        """Freeze shared work/dependencies before installing solve smoothers."""
+        self._hierarchy_setup_work = tuple(work)
+        # Store names by level, not object identities, so copies/pickles work.
+        self._hierarchy_setup_dependencies = [
+            tuple(name for name in ('rho', 'rho_D_inv')
+                  if work.key(level.A, name) in work.seen)
+            for level in self.levels[:-1]]
+
+    def setup_work_breakdown(self):
+        """Raw (numerical, graph) estimates for this active configuration.
+
+        These are logical per-configuration costs, not the physical marginal
+        cost of reusing an already-built hierarchy or a cached factorization.
+        Dense coarse factorization costs retain the existing FMA estimates;
+        sparse LU and iterative coarse solves are not precisely modeled.
+        """
+        hierarchy = self._hierarchy_setup_work
+        smoother = getattr(self, '_smoother_setup_work', (0, 0))
+        coarse_A = self.levels[-1].A
+        n = coarse_A.shape[0]
+        name = _get_coarse_solver_name(self.coarse_solver)
+        coarse = {'cholesky': n**3 // 6, 'lu': n**3 // 3,
+                  'pinv': 3*n**3, 'pinv2': 3*n**3,
+                  'splu': coarse_A.nnz}.get(name, 0)
+        return {'hierarchy': hierarchy, 'smoother': smoother, 'coarse': (coarse, 0)}
+
     def setup_complexity(self):
         """Setup complexity of building this multigrid hierarchy.
 
@@ -583,6 +610,11 @@ class MultilevelSolver:
         rootnode_solver).
 
         """
+        if hasattr(self, '_hierarchy_setup_work'):
+            parts = self.setup_work_breakdown().values()
+            nnz0 = float(self.levels[0].A.nnz)
+            return tuple(sum(part[i] for part in parts) / nnz0 for i in range(2))
+
         if not hasattr(self, '_setup_work'):
             return (0.0, 0.0)
 

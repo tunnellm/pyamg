@@ -7,6 +7,7 @@ from scipy.sparse import csr_array, issparse, SparseEfficiencyWarning
 
 from pyamg.multilevel import MultilevelSolver
 from pyamg.relaxation.smoothing import change_smoothers
+from pyamg.util.setup_work import SetupWork
 from pyamg.util.utils import eliminate_diag_dom_nodes, get_blocksize, asfptype, \
     levelize_strength_or_aggregation, levelize_smooth_or_improve_candidates, \
     spmm_work, spmm_graph_work
@@ -272,7 +273,7 @@ def smoothed_aggregation_solver(A, B=None, BH=None,
         levels[-1].BH = BH    # left candidates
 
     # Track work: [numerical_work, graph_work]
-    work = [0, 0]
+    work = SetupWork()
 
     while len(levels) < max_levels and\
             int(levels[-1].A.shape[0]/get_blocksize(levels[-1].A)) > max_coarse:
@@ -280,6 +281,7 @@ def smoothed_aggregation_solver(A, B=None, BH=None,
                           improve_candidates, diagonal_dominance, keep, work)
 
     ml = MultilevelSolver(levels, **kwargs)
+    ml.record_hierarchy_setup(work)
     change_smoothers(ml, presmoother, postsmoother, work=work)
     ml._setup_work = tuple(work)
     return ml

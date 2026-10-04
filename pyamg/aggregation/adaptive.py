@@ -387,6 +387,9 @@ def adaptive_sa_solver(A, initial_candidates=None, symmetry='hermitian',
         work[0] += ml._setup_work[0]
         work[1] += ml._setup_work[1]
     ml._setup_work = tuple(work)
+    # Adaptive setup includes earlier candidate-generation hierarchies.
+    # Retain that accumulated work, rather than only the final SA hierarchy.
+    ml._hierarchy_setup_work = tuple(work[i] - ml._smoother_setup_work[i] for i in range(2))
     return ml
 
 

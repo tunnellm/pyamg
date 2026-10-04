@@ -7,6 +7,7 @@ from scipy.sparse import csr_array, issparse, SparseEfficiencyWarning
 
 from ..multilevel import MultilevelSolver
 from ..relaxation.smoothing import change_smoothers
+from ..util.setup_work import SetupWork
 from ..relaxation.utils import relaxation_as_linear_operator
 from ..util.utils import scale_T, get_Cpt_params, \
     eliminate_diag_dom_nodes, get_blocksize, \
@@ -304,7 +305,7 @@ def rootnode_solver(A, B=None, BH=None,
         levels[-1].BH = BH    # left candidates
 
     # Track work: [numerical_work, graph_work]
-    work = [0, 0]
+    work = SetupWork()
 
     while len(levels) < max_levels and \
             int(levels[-1].A.shape[0]/get_blocksize(levels[-1].A)) > max_coarse:
@@ -312,6 +313,7 @@ def rootnode_solver(A, B=None, BH=None,
                           improve_candidates, diagonal_dominance, keep, work)
 
     ml = MultilevelSolver(levels, **kwargs)
+    ml.record_hierarchy_setup(work)
     change_smoothers(ml, presmoother, postsmoother, work=work)
     ml._setup_work = tuple(work)
     return ml

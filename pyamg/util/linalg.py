@@ -8,6 +8,7 @@ from scipy.sparse.linalg import aslinearoperator
 from scipy.linalg import lapack, get_blas_funcs, eig, svd
 
 from .params import set_tol
+from .setup_work import SetupWork
 
 
 def norm(x, pnorm='2'):
@@ -379,14 +380,20 @@ def approximate_spectral_radius(A, tol=0.01, maxiter=15, restart=5,
 
         # Count work: each matvec is nnz FMAs
         if work is not None and sparse.issparse(A):
-            work[0] += total_matvecs * A.nnz
+            if isinstance(work, SetupWork):
+                work.charge(A, 'rho', total_matvecs * A.nnz)
+            else:
+                work[0] += total_matvecs * A.nnz
 
         if return_vector:
             return (rho, v0)
 
         return rho
 
-    # Cached result - no work to count
+    # Reuse is physically free, but independently benchmarked configurations
+    # must still pay for the estimator unless hierarchy construction paid it.
+    if isinstance(work, SetupWork) and sparse.issparse(A):
+        work.charge(A, 'rho', A.rho_matvecs * A.nnz)
     return A.rho
 
 
