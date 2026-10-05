@@ -29,6 +29,17 @@ def _get_coarse_solver_name(solver):
     return None
 
 
+def _checked_inner_ratio(numerator, denominator, cycle):
+    """Fail explicitly on an unusable inner direction, never manufacture NaNs."""
+    if not np.isfinite(numerator) or not np.isfinite(denominator) or denominator == 0:
+        raise np.linalg.LinAlgError(f'{cycle} inner breakdown: invalid direction product')
+    with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
+        ratio = numerator / denominator
+    if not np.isfinite(ratio):
+        raise np.linalg.LinAlgError(f'{cycle} inner breakdown: nonfinite step')
+    return ratio
+
+
 class MultilevelSolver:
     """Stores multigrid hierarchy and implements the multigrid cycle.
 
@@ -331,7 +342,7 @@ class MultilevelSolver:
                                 schwarz_sweep = 2
                 if subdomain_ptr is not None:
                     sizes = subdomain_ptr[1:] - subdomain_ptr[:-1]
-                    total_cost = np.sum(sizes * sizes) * schwarz_iters * schwarz_sweep
+                    total_cost = sum(int(size)**2 for size in sizes) * schwarz_iters * schwarz_sweep
                     return total_cost / A.nnz
                 # Fallback: assume average subdomain size is nnz/n
                 return A.nnz / A.shape[0] * iterations * sweep_factor
@@ -971,6 +982,15 @@ class MultilevelSolver:
         """
         A = self.levels[lvl].A
 
+        # CAPPA applies cycles directly, including valid single-level hierarchies.
+        if lvl == len(self.levels) - 1:
+            x[:] = self.coarse_solver(A, b)
+            if cycle == 'K':
+                if not hasattr(self, '_k_level_costs'):
+                    self._precompute_k_costs()
+                return self._k_coarse_cost
+            return 0
+
         self.levels[lvl].presmoother(A, x, b)
 
         residual = b - _matvec(A, x)
@@ -1003,6 +1023,8 @@ class MultilevelSolver:
             p = np.zeros((nAMLI, coarse_b.shape[0]), dtype=coarse_b.dtype)
             beta = np.zeros((nAMLI, nAMLI), dtype=coarse_b.dtype)
             for k in range(nAMLI):
+                if not np.any(coarse_b):
+                    break
                 # New search direction --> M^{-1}@residual
                 p[k, :] = 1
                 self.__solve(lvl + 1, p[k, :].reshape(coarse_b.shape),
@@ -1010,14 +1032,16 @@ class MultilevelSolver:
 
                 # Orthogonalize new search direction to old directions
                 for j in range(k):  # loops from j = 0...(k-1)
-                    beta[k, j] = np.inner(p[j, :].conj(), _matvec(Ac, p[k, :])) /\
-                            np.inner(p[j, :].conj(), _matvec(Ac, p[j, :]))
+                    beta[k, j] = _checked_inner_ratio(
+                        np.inner(p[j, :].conj(), _matvec(Ac, p[k, :])),
+                        np.inner(p[j, :].conj(), _matvec(Ac, p[j, :])), 'AMLI')
                     p[k, :] -= beta[k, j] * p[j, :]
 
                 # Compute step size
                 Ap = _matvec(Ac, p[k, :])
-                alpha = np.inner(p[k, :].conj(), np.ravel(coarse_b)) /\
-                        np.inner(p[k, :].conj(), Ap)
+                alpha = _checked_inner_ratio(
+                    np.inner(p[k, :].conj(), np.ravel(coarse_b)),
+                    np.inner(p[k, :].conj(), Ap), 'AMLI')
 
                 # Update solution
                 coarse_x += alpha * p[k, :].reshape(coarse_x.shape)
@@ -1032,7 +1056,7 @@ class MultilevelSolver:
             #
             # _k_cg_iters: max FCG iterations per level (paper's ℓ)
             # _k_early_exit: residual ratio threshold for early exit, or 0
-            #   to force exactly _k_cg_iters iterations.
+            #   to force _k_cg_iters iterations unless the residual is exactly zero.
 
             # Ensure per-level fixed costs are precomputed
             if not hasattr(self, '_k_level_costs'):
@@ -1041,6 +1065,8 @@ class MultilevelSolver:
             Ac = self.levels[lvl + 1].A
             n_c = Ac.shape[0]
             nK = getattr(self, '_k_cg_iters', 2)
+            if nK < 1:
+                raise ValueError('K-cycle iteration count must be positive')
             early_exit = getattr(self, '_k_early_exit', 0.0)
 
             # Start with this level's fixed costs (smoothing + residual + transfers)
@@ -1050,22 +1076,14 @@ class MultilevelSolver:
             r = coarse_b.copy()
             norm_r0_sq = np.inner(r.conj(), r) if early_exit > 0 else 0
 
-            # Iteration 0: w = K^{-1} r, d = w (no previous direction)
             w = np.zeros_like(r)
-            level_cost += self.__solve(lvl + 1, w, r, 'K')
-
-            d = w.copy()
-            Ad = _matvec(Ac, d)                 # 1 SpMV
-            level_cost += Ac.nnz
-            dAd = np.inner(d.conj(), Ad)
-            alpha = np.inner(d.conj(), r) / dAd
-            coarse_x += alpha * d
-            r -= alpha * Ad
-            level_cost += 4 * n_c               # 2 dots + 2 axpys
-
-            for _ in range(1, nK):
+            for inner_iter in range(nK):
+                # An exact inner solution needs no further direction, even when
+                # ratio-based early exit is disabled for fixed K-cycle counts.
+                if not np.any(r):
+                    break
                 # Early exit: skip remaining iterations if residual is small
-                if early_exit > 0:
+                if inner_iter > 0 and early_exit > 0:
                     norm_r_sq = np.inner(r.conj(), r)
                     if norm_r_sq < early_exit * early_exit * norm_r0_sq:
                         break
@@ -1074,17 +1092,19 @@ class MultilevelSolver:
                 w[:] = 0
                 level_cost += self.__solve(lvl + 1, w, r, 'K')
 
-                # A-orthogonalize: d_new = w - (w'Ad / d'Ad) d
-                # By symmetry: w'Ad = (Ac@w)'d, but we already have Ad
-                beta = np.inner(w.conj(), Ad) / dAd
-                d = w - beta * d
-                level_cost += 2 * n_c           # 1 dot + 1 axpy
+                if inner_iter == 0:
+                    d = w.copy()
+                else:
+                    # A-orthogonalize against the previous direction.
+                    beta = _checked_inner_ratio(np.inner(w.conj(), Ad), dAd, 'K')
+                    d = w - beta * d
+                    level_cost += 2 * n_c       # 1 dot + 1 axpy
 
                 # Step size and update
                 Ad = _matvec(Ac, d)             # 1 SpMV
                 level_cost += Ac.nnz
                 dAd = np.inner(d.conj(), Ad)
-                alpha = np.inner(d.conj(), r) / dAd
+                alpha = _checked_inner_ratio(np.inner(d.conj(), r), dAd, 'K')
                 coarse_x += alpha * d
                 r -= alpha * Ad
                 level_cost += 4 * n_c           # 2 dots + 2 axpys

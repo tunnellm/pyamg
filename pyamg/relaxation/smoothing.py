@@ -571,11 +571,10 @@ def setup_schwarz(lvl, iterations=DEFAULT_NITER, subdomain=None,
 
     if work is not None:
         # Setup cost: extract subblocks (graph) + invert each block (numerical)
-        blocksizes = subdomain_ptr[1:] - subdomain_ptr[:-1]
         # Graph work: scan A sparsity pattern to extract subblocks
         work[1] += lvl.Acsr.nnz
         # Numerical work: dense factorization ~ domain_size^3 / 3 per block
-        work[0] += int(np.sum(blocksizes ** 3) // 3)
+        work[0] += relaxation._schwarz_setup_work(subdomain_ptr)
 
     def smoother(A, x, b):
         relaxation.schwarz(lvl.Acsr, x, b, iterations=iterations,
@@ -601,11 +600,14 @@ def setup_strength_based_schwarz(lvl, iterations=DEFAULT_NITER,
     subdomain_ptr = C.indptr.copy()
     subdomain = C.indices.copy()
 
+    # Reject unsafe native layouts during configuration, before the first solve.
+    subdomain, subdomain_ptr, _, _ = relaxation._schwarz_block_layout(
+        subdomain, subdomain_ptr, lvl.A.shape[0])
+
     # Count setup work once here (same formula as setup_schwarz)
     if work is not None:
-        blocksizes = subdomain_ptr[1:] - subdomain_ptr[:-1]
         work[1] += lvl.A.nnz
-        work[0] += int(np.sum(blocksizes ** 3) // 3)
+        work[0] += relaxation._schwarz_setup_work(subdomain_ptr)
 
     def strength_based_schwarz(A, x, b):
         smoother = setup_schwarz(lvl, iterations=iterations, subdomain=subdomain,

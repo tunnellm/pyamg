@@ -1000,6 +1000,46 @@ def gauss_seidel_nr(A, x, b, iterations=1, sweep='forward', omega=1.0,
 # same as any preexisting subdomain and subdomain_ptr?
 
 
+def _schwarz_block_layout(subdomain, subdomain_ptr, nrows):
+    """Validate domains and build offsets representable by the int32 kernels."""
+    subdomain = np.asarray(subdomain)
+    subdomain_ptr = np.asarray(subdomain_ptr)
+    for values in (subdomain, subdomain_ptr):
+        if values.ndim != 1 or values.dtype.kind not in 'iu':
+            raise ValueError('Schwarz indices and pointers must be integer vectors')
+    limit = np.iinfo(np.int32).max
+    if nrows > limit or subdomain.size > limit or subdomain_ptr.size > limit:
+        raise OverflowError('Schwarz structure exceeds the native int32 index range')
+    if (subdomain_ptr.size < 2 or subdomain_ptr[0] != 0
+            or subdomain_ptr[-1] != subdomain.size
+            or np.any(subdomain_ptr[1:] <= subdomain_ptr[:-1])):
+        raise ValueError('Schwarz pointers must delimit nonempty domains from 0 to len(indices)')
+    if np.any(subdomain >= nrows) or np.any(subdomain < 0):
+        raise ValueError('Schwarz domain index outside the matrix')
+    bad_order = subdomain[1:] <= subdomain[:-1]
+    bad_order[subdomain_ptr[1:-1].astype(np.int64) - 1] = False
+    if np.any(bad_order):
+        raise ValueError('Schwarz domain indices must be sorted and unique')
+    sizes = np.diff(subdomain_ptr.astype(np.int64))
+    # Each block must fit int32. Once that is checked, the total fits int64
+    # because there are at most int32.max domains. Avoid a Python object per row.
+    squares = sizes * sizes
+    if np.any(squares > limit) or int(squares.sum()) > limit:
+        raise OverflowError('Schwarz dense blocks exceed the native int32 index range')
+    offsets = np.empty(subdomain_ptr.size, dtype=np.int32)
+    offsets[0] = 0
+    np.cumsum(squares, dtype=np.int64, out=offsets[1:])
+    return (np.ascontiguousarray(subdomain, dtype=np.int32),
+            np.ascontiguousarray(subdomain_ptr, dtype=np.int32),
+            sizes, offsets)
+
+
+def _schwarz_setup_work(subdomain_ptr):
+    """Exact integer setup model, including domains whose cube exceeds int32."""
+    return sum((int(b) - int(a))**3
+               for a, b in zip(subdomain_ptr[:-1], subdomain_ptr[1:])) // 3
+
+
 def schwarz_parameters(A, subdomain=None, subdomain_ptr=None,
                        inv_subblock=None, inv_subblock_ptr=None):
     """Set Schwarz parameters.
@@ -1035,8 +1075,8 @@ def schwarz_parameters(A, subdomain=None, subdomain_ptr=None,
         if subdomain is not None and subdomain_ptr is not None:
             # check that the existing parameters correspond to the same
             # subdomains
-            if np.array(A.schwarz_parameters[0] == subdomain).all() and \
-               np.array(A.schwarz_parameters[1] == subdomain_ptr).all():
+            if np.array_equal(A.schwarz_parameters[0], subdomain) and \
+               np.array_equal(A.schwarz_parameters[1], subdomain_ptr):
                 return A.schwarz_parameters
         else:
             return A.schwarz_parameters
@@ -1046,12 +1086,17 @@ def schwarz_parameters(A, subdomain=None, subdomain_ptr=None,
         subdomain_ptr = A.indptr.copy()
         subdomain = A.indices.copy()
 
+    A.check_format(full_check=True)
+    if A.shape[0] != A.shape[1] or not A.has_sorted_indices:
+        raise ValueError('Schwarz requires a square matrix with sorted CSR indices')
+    if A.nnz > np.iinfo(np.int32).max:
+        raise OverflowError('Schwarz matrix exceeds the native int32 index range')
+    subdomain, subdomain_ptr, blocksize, expected_ptr = \
+        _schwarz_block_layout(subdomain, subdomain_ptr, A.shape[0])
+
     # Extract each subdomain's block from the matrix
     if inv_subblock is None or inv_subblock_ptr is None:
-        inv_subblock_ptr = np.zeros(subdomain_ptr.shape,
-                                    dtype=A.indices.dtype)
-        blocksize = subdomain_ptr[1:] - subdomain_ptr[:-1]
-        inv_subblock_ptr[1:] = np.cumsum(blocksize*blocksize)
+        inv_subblock_ptr = expected_ptr
 
         # Extract each block column from A
         inv_subblock = np.zeros((inv_subblock_ptr[-1],), dtype=A.dtype)
@@ -1073,6 +1118,13 @@ def schwarz_parameters(A, subdomain=None, subdomain_ptr=None,
                                   rhs, cond=cond, overwrite_a=True,
                                   overwrite_b=True)
             inv_subblock[j0:j1] = np.ravel(gelssoutput[1])
+    else:
+        if (not np.array_equal(inv_subblock_ptr, expected_ptr)
+                or np.ndim(inv_subblock) != 1
+                or len(inv_subblock) != expected_ptr[-1]):
+            raise ValueError('Schwarz inverse blocks do not match the domain layout')
+        inv_subblock_ptr = expected_ptr
+        inv_subblock = np.ascontiguousarray(inv_subblock, dtype=A.dtype)
 
     A.schwarz_parameters = (subdomain, subdomain_ptr, inv_subblock,
                             inv_subblock_ptr)
