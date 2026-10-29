@@ -559,9 +559,28 @@ def setup_jacobi(lvl, iterations=DEFAULT_NITER, omega=1.0, withrho=True, work=No
     return smoother
 
 
+def _schwarz_application_work(A, subdomain, subdomain_ptr, iterations, sweep):
+    """Count real-valued native Schwarz arithmetic, once per configuration.
+
+    Each domain recomputes its rows' residuals and applies a dense inverse.
+    Scalar additions are retained separately and charged one work unit each.
+    """
+    if sweep not in ('forward', 'backward', 'symmetric'):
+        raise ValueError('invalid Schwarz sweep')
+    visits = np.bincount(subdomain, minlength=A.shape[0])
+    sizes = np.diff(subdomain_ptr).astype(np.float64)
+    multiplier = iterations * (2 if sweep == 'symmetric' else 1)
+    residual = float(np.sum(visits * np.diff(A.indptr).astype(np.float64)))
+    dense = float(np.sum(sizes * sizes))
+    additions = 2.0 * len(subdomain)
+    return {'residual_fma': multiplier * residual,
+            'dense_fma': multiplier * dense,
+            'scalar_adds': multiplier * additions}
+
+
 def setup_schwarz(lvl, iterations=DEFAULT_NITER, subdomain=None,
                   subdomain_ptr=None, inv_subblock=None, inv_subblock_ptr=None,
-                  sweep=DEFAULT_SWEEP, work=None):
+                  sweep=DEFAULT_SWEEP, work=None, _application_work=None):
     """Set up Schwarz."""
     matrix_asformat(lvl, 'A', 'csr')
     lvl.Acsr.sort_indices()
@@ -583,6 +602,9 @@ def setup_schwarz(lvl, iterations=DEFAULT_NITER, subdomain=None,
                            inv_subblock=inv_subblock,
                            inv_subblock_ptr=inv_subblock_ptr, sweep=sweep)
     update_wrapper(smoother, relaxation.schwarz)  # set __name__
+    smoother._cappa_apply_work = (
+        _schwarz_application_work(lvl.Acsr, subdomain, subdomain_ptr, iterations, sweep)
+        if _application_work is None else _application_work)
     return smoother
 
 
@@ -609,10 +631,16 @@ def setup_strength_based_schwarz(lvl, iterations=DEFAULT_NITER,
         work[1] += lvl.A.nnz
         work[0] += relaxation._schwarz_setup_work(subdomain_ptr)
 
+    matrix_asformat(lvl, 'A', 'csr')
+    application_work = _schwarz_application_work(
+        lvl.Acsr, subdomain, subdomain_ptr, iterations, sweep)
+
     def strength_based_schwarz(A, x, b):
         smoother = setup_schwarz(lvl, iterations=iterations, subdomain=subdomain,
-                                 subdomain_ptr=subdomain_ptr, sweep=sweep)
+                                 subdomain_ptr=subdomain_ptr, sweep=sweep,
+                                 _application_work=application_work)
         smoother(A, x, b)
+    strength_based_schwarz._cappa_apply_work = application_work
     return strength_based_schwarz
 
 

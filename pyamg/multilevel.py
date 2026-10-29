@@ -40,6 +40,16 @@ def _checked_inner_ratio(numerator, denominator, cycle):
     return ratio
 
 
+def _configured_smoother_work(smoother, A):
+    """Use configured native-operation counts when supplied by a smoother."""
+    work = getattr(smoother, '_cappa_apply_work', None)
+    if work is not None:
+        return sum(work.values()) / A.nnz
+    if getattr(smoother, '__name__', '') in ('schwarz', 'strength_based_schwarz'):
+        raise ValueError('Schwarz smoother is missing configured application work')
+    return None
+
+
 class MultilevelSolver:
     """Stores multigrid hierarchy and implements the multigrid cycle.
 
@@ -278,6 +288,10 @@ class MultilevelSolver:
             if smoother is None:
                 return 1  # default cost when no smoother specified
 
+            configured = _configured_smoother_work(smoother, A)
+            if configured is not None:
+                return configured
+
             iterations = 1
             degree = 1
             sweep_factor = 1
@@ -324,28 +338,6 @@ class MultilevelSolver:
                 # Cost: k SpMVs + n*k^2 Arnoldi orthogonalization
                 n = A.shape[0]
                 return maxiter + n * maxiter * maxiter / A.nnz
-
-            # Schwarz: cost is sum of subdomain_size^2 for dense block solves
-            if smoother_name == 'schwarz':
-                subdomain_ptr = None
-                schwarz_iters = 1
-                schwarz_sweep = 1
-                if hasattr(smoother, '__closure__') and smoother.__closure__:
-                    for varname, cell in zip(smoother.__code__.co_freevars,
-                                             smoother.__closure__):
-                        if varname == 'subdomain_ptr':
-                            subdomain_ptr = cell.cell_contents
-                        elif varname == 'iterations':
-                            schwarz_iters = cell.cell_contents
-                        elif varname == 'sweep':
-                            if cell.cell_contents == 'symmetric':
-                                schwarz_sweep = 2
-                if subdomain_ptr is not None:
-                    sizes = subdomain_ptr[1:] - subdomain_ptr[:-1]
-                    total_cost = sum(int(size)**2 for size in sizes) * schwarz_iters * schwarz_sweep
-                    return total_cost / A.nnz
-                # Fallback: assume average subdomain size is nnz/n
-                return A.nnz / A.shape[0] * iterations * sweep_factor
 
             return iterations * degree * sweep_factor * block_factor * ne_factor
 
@@ -480,6 +472,9 @@ class MultilevelSolver:
             """Compute cost multiplier for a smoother relative to nnz(A)."""
             if smoother is None:
                 return 1
+            configured = _configured_smoother_work(smoother, A)
+            if configured is not None:
+                return configured
             iterations = 1
             sweep_factor = 1
             degree = 1
