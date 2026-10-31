@@ -40,6 +40,36 @@ def test_budget_boundaries(builder, cycle, smoother):
     assert exact.status == 'COMPLETE'
     np.testing.assert_array_equal(full.solution, exact.solution)
     np.testing.assert_array_equal(b, saved)
+    workspace = np.full_like(b, np.nan)
+    for limit in (full.work, 0, full.work//2, full.work-1, full.work):
+        independent = driver.apply(b, limit)
+        reused = driver.apply(b, limit, workspace=workspace)
+        assert reused.status == independent.status
+        assert reused.work == independent.work
+        assert reused.components == independent.components
+        assert reused.accepted_ratios == independent.accepted_ratios
+        assert reused.blocked == independent.blocked
+        if reused.status == 'COMPLETE':
+            assert reused.solution is workspace
+            np.testing.assert_array_equal(reused.solution, independent.solution)
+        else:
+            assert reused.solution is None
+        np.testing.assert_array_equal(b, saved)
+    # Borrowed calls must not mutate an earlier independently owned result.
+    np.testing.assert_array_equal(full.solution, exact.solution)
+
+
+def test_workspace_rejection_does_not_mutate_rhs():
+    ml = pyamg.ruge_stuben_solver(poisson((8, 8), format='csr'), max_coarse=2)
+    driver = BudgetedCycle(ml, 'K', 1e-3)
+    b = np.ones(64)
+    readonly = np.ones(64)
+    readonly.flags.writeable = False
+    for workspace in (b, b.view(), np.ones(63), np.ones(64, dtype=np.float32),
+                      np.ones(128)[::2], readonly, list(b)):
+        with pytest.raises(ValueError, match='workspace'):
+            driver.apply(b, workspace=workspace)
+        np.testing.assert_array_equal(b, np.ones(64))
 
 
 @pytest.mark.parametrize('cycle', ['K', 'AMLI'])

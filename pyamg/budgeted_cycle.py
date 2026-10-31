@@ -148,7 +148,15 @@ class BudgetedCycle:
         return smoother, stage, int(cost)
 
     @with_serial_blas
-    def apply(self, b, limit=math.inf):
+    def apply(self, b, limit=math.inf, *, workspace=None):
+        """Apply from zero, optionally borrowing caller-owned solution storage.
+
+        A supplied workspace is overwritten, including on budget interruption or
+        error. On success, ``result.solution`` aliases it. Callers that need
+        transactional output must use separate scratch storage and publish only
+        a COMPLETE result. Without a workspace the result remains independently
+        owned, as in the original interface.
+        """
         b = np.asarray(b)
         if b.dtype != np.float64 or b.ndim != 1 or b.size != self.ml.levels[0].A.shape[0]:
             raise ValueError('budgeted application requires a matching real FP64 vector')
@@ -157,7 +165,16 @@ class BudgetedCycle:
         ledger = Ledger(limit)
         ops = Operations(ledger)
         accepted = []
-        x = np.zeros_like(b)
+        if workspace is None:
+            x = np.zeros_like(b)
+        else:
+            if (not isinstance(workspace, np.ndarray) or
+                    workspace.dtype != np.float64 or workspace.shape != b.shape or
+                    not workspace.flags.c_contiguous or not workspace.flags.writeable or
+                    np.shares_memory(workspace, b)):
+                raise ValueError('workspace must be writable contiguous FP64 storage disjoint from RHS')
+            x = workspace
+            x.fill(0)
 
         def ratio(numerator, denominator):
             if not np.isfinite(numerator) or not np.isfinite(denominator) or denominator == 0:
