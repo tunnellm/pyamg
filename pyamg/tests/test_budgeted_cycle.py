@@ -9,7 +9,7 @@ from scipy.sparse import eye, diags
 import pyamg
 from pyamg.gallery import poisson
 from pyamg.relaxation.smoothing import change_smoothers
-from pyamg.budgeted_cycle import BudgetedCycle, Ledger, ApplicationWorkLimit
+from pyamg.budgeted_cycle import BudgetedCycle, Ledger, Operations, ApplicationWorkLimit
 
 
 @pytest.mark.parametrize('cycle', ['K', 'AMLI'])
@@ -122,6 +122,71 @@ def test_zero_and_underflow_are_distinct(cycle):
         driver.apply(np.full(2, 1e-170))
 
 
+def test_scaled_norm_accepts_representable_large_values_and_rejects_overflow():
+    ledger = Ledger()
+    ops = Operations(ledger)
+    # Squaring these entries directly would overflow, but the norm fits.
+    assert ops.norm(np.full(2, 1e200)) == np.sqrt(2)*1e200
+    assert ledger.spent == 6
+    with pytest.raises(np.linalg.LinAlgError, match='nonfinite inner residual norm'):
+        ops.norm(np.full(2, 1.4e308))
+    assert ledger.spent == 6
+    assert ledger.failed_operation == dict(stage='monitor_norm_model', reserved_work=6)
+
+
+@pytest.mark.parametrize('cycle', ['K', 'AMLI'])
+def test_overflowing_rhs_norm_cannot_accept_presmoothing(cycle):
+    A = eye(2, format='csr')
+    calls = []
+
+    def pre(A, x, b):
+        calls.append('pre')
+        x[:] = 0.5*b
+
+    def post(A, x, b):
+        calls.append('post')
+
+    pre._cappa_apply_work = post._cappa_apply_work = {'fixture': 2}
+    ml = pyamg.multilevel.MultilevelSolver([
+        SimpleNamespace(A=A, P=A, R=A, presmoother=pre, postsmoother=post),
+        SimpleNamespace(A=A)], coarse_solver='pinv')
+    b = np.full(2, 1.4e308)
+    saved = b.copy()
+    # The actual relative residual is 0.5, not the erroneous finite/Inf=0.
+    with pytest.raises(np.linalg.LinAlgError, match='nonfinite inner residual norm'):
+        BudgetedCycle(ml, cycle, 1e-3).apply(b)
+    assert calls == ['pre']
+    np.testing.assert_array_equal(b, saved)
+
+
+@pytest.mark.parametrize('cycle', ['K', 'AMLI'])
+def test_overflowing_rhs_norm_cannot_accept_between_cycles(cycle):
+    A = eye(2, format='csr')
+    ml = pyamg.multilevel.MultilevelSolver([SimpleNamespace(A=A)], coarse_solver='pinv')
+    # Deliberately inexact cached coarse inverse isolates the direct-only
+    # between-cycle checkpoint: its true relative residual is exactly 0.5.
+    ml.coarse_solver.P = 0.5*np.eye(2)
+    b = np.full(2, 1.4e308)
+    one = BudgetedCycle(ml, cycle, 1e-3, num_cycles=1).apply(b)
+    np.testing.assert_array_equal(one.solution, 0.5*b)
+    assert one.accepted_ratios == []  # No monitor after the last traversal.
+    with pytest.raises(np.linalg.LinAlgError, match='nonfinite inner residual norm'):
+        BudgetedCycle(ml, cycle, 1e-3, num_cycles=2).apply(b)
+
+
+@pytest.mark.parametrize('cycle', ['K', 'AMLI'])
+def test_one_level_fresh_checkpoint_charge(cycle):
+    A = eye(2, format='csr')
+    ml = pyamg.multilevel.MultilevelSolver([SimpleNamespace(A=A)], coarse_solver='pinv')
+    b = np.ones(2)
+    one = BudgetedCycle(ml, cycle, 1e-3, num_cycles=1).apply(b)
+    two = BudgetedCycle(ml, cycle, 1e-3, num_cycles=2).apply(b)
+    assert two.work-one.work == A.nnz+5*b.size+4
+    assert two.checkpoint_counts['between_cycle_stops'] == 1
+    assert two.work == sum(two.components.values())
+    np.testing.assert_array_equal(one.solution, two.solution)
+
+
 def test_ledger_and_configuration_rejection():
     ledger = Ledger(5)
     assert ledger.perform('first', 3, lambda: 42) == 42
@@ -180,7 +245,7 @@ def test_deep_chain_returns_before_underflow(cycle):
     assert result.accepted_ratios and all(r <= 1e-3 for r in result.accepted_ratios)
     assert 'gauss_seidel_model_2_pre' in result.components
     assert 'gauss_seidel_model_3_pre' not in result.components
-    assert 'gauss_seidel_model_2_post' not in result.components
+    assert 'gauss_seidel_model_2_post' in result.components
     assert 'coarse_apply_model' not in result.components
     assert result.work == sum(result.components.values())
     assert np.linalg.norm(b-A@result.solution) < np.linalg.norm(b)
@@ -198,7 +263,7 @@ def test_presmoothing_checkpoint_is_relative_fresh_and_budgeted(cycle, relative_
         x[:] = (1-relative_error)*b
 
     def post(A, x, b):
-        pytest.fail('postsmoothing must not run after acceptance')
+        calls.append('post')
 
     pre._cappa_apply_work = post._cappa_apply_work = {'fixture': n}
     ml = pyamg.multilevel.MultilevelSolver([
@@ -231,10 +296,76 @@ def test_presmoothing_checkpoint_is_relative_fresh_and_budgeted(cycle, relative_
         np.testing.assert_array_equal(result.solution, (1-relative_error)*b)
         assert result.accepted_ratios == [relative_error]
         # pre + fresh SpMV + subtraction + two stable norms; no transfer,
-        # coarse application, or postsmoothing is billed.
-        assert result.work == 3*n + 2*(2*n+2)
+        # coarse application is billed; the paired postsmoother is retained.
+        assert calls[-1] == 'post'
+        assert result.work == 4*n + 2*(2*n+2)
         partial = driver.apply(b, result.work-1)
         assert partial.status == 'WORK_LIMIT' and partial.solution is None
-        assert partial.blocked['stage'] == 'monitor_norm_model'
-        assert partial.work == result.work-(2*n+2)
+        assert partial.blocked['stage'] == 'schwarz_0_post'
+        assert partial.work == result.work-n
         assert driver.apply(b, result.work).status == 'COMPLETE'
+
+
+@pytest.mark.parametrize('cycle', ['K', 'AMLI'])
+def test_postsmoothing_invalidates_pre_acceptance_and_counters_are_bounded(cycle):
+    n = 4
+    A = eye(n, format='csr')
+    def pre(A, x, b):
+        x[:] = b
+    def post(A, x, b):
+        x[:] = 0
+    pre._cappa_apply_work = post._cappa_apply_work = {'fixture': n}
+    ml = pyamg.multilevel.MultilevelSolver([
+        SimpleNamespace(A=A, P=A, R=A, presmoother=pre, postsmoother=post),
+        SimpleNamespace(A=A)], coarse_solver='pinv')
+    result = BudgetedCycle(ml, cycle, 1e-3, num_cycles=100).apply(np.ones(n))
+    np.testing.assert_array_equal(result.solution, np.zeros(n))
+    assert result.checkpoint_counts == {
+        'accepted_checkpoints': 100, 'presmoothing_acceptance_level_0': 100,
+        'cycles_completed': 100, 'accepted_ratio_samples_dropped': 36}
+    assert len(result.accepted_ratios) == 64
+    assert result.work == sum(result.components.values())
+
+
+@pytest.mark.parametrize('cycle', ['K', 'AMLI'])
+def test_complete_cycle_stops_before_next_and_charges_fresh_check(cycle):
+    A = eye(4, format='csr')
+    def pre(A, x, b):
+        pass
+    def post(A, x, b):
+        x[:] = b
+    pre._cappa_apply_work = post._cappa_apply_work = {'fixture': 4}
+    ml = pyamg.multilevel.MultilevelSolver([
+        SimpleNamespace(A=A, P=A, R=A, presmoother=pre, postsmoother=post),
+        SimpleNamespace(A=A)], coarse_solver='pinv')
+    b = np.ones(4)
+    one = BudgetedCycle(ml, cycle, 1e-3, num_cycles=1).apply(b)
+    two = BudgetedCycle(ml, cycle, 1e-3, num_cycles=2).apply(b)
+    np.testing.assert_array_equal(one.solution, two.solution)
+    assert two.work-one.work == A.nnz+3*b.size+2
+    assert two.checkpoint_counts['cycles_completed'] == 1
+    assert two.checkpoint_counts['between_cycle_stops'] == 1
+    assert BudgetedCycle(ml, cycle, 1e-3, num_cycles=2).apply(b, two.work-1).solution is None
+
+
+@pytest.mark.parametrize('cycle', ['K', 'AMLI'])
+def test_fixed_early_acceptance_pattern_matches_sgs(cycle):
+    n = 32
+    A = diags([np.full(n-1, 1e-4), np.linspace(1., 1.2, n), np.full(n-1, 1e-4)],
+              [-1, 0, 1], format='csr')
+    ml = pyamg.ruge_stuben_solver(A, max_coarse=2)
+    change_smoothers(ml, ('gauss_seidel', {'sweep': 'forward'}),
+                    ('gauss_seidel', {'sweep': 'backward'}))
+    driver = BudgetedCycle(ml, cycle, 1e-3)
+    columns = []
+    for rhs in np.eye(n):
+        result = driver.apply(rhs)
+        assert 'gauss_seidel_model_0_post' in result.components
+        assert 'gauss_seidel_model_1_pre' not in result.components
+        columns.append(result.solution)
+    B = np.column_stack(columns)
+    dense = A.toarray()
+    expected = np.linalg.solve(np.triu(dense), np.diag(np.diag(dense))@np.linalg.inv(np.tril(dense)))
+    np.testing.assert_allclose(B, expected, rtol=2e-15, atol=2e-15)
+    np.testing.assert_allclose(B, B.T, rtol=2e-15, atol=2e-15)
+    # Fixed-pattern demonstration only, not nonlinear K/AMLI symmetry in general.

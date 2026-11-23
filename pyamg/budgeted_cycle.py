@@ -5,12 +5,14 @@ Schwarz uses configured native-loop counts. GS, coarse solves and norm monitorin
 retain explicitly named arithmetic models; these are not hardware counters.
 """
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import numbers
 
 import numpy as np
 from .util.sparse_blas import with_serial_blas
+
+APPLICATION_CONTRACT = 'balanced_checkpoint_v2'
 
 
 class ApplicationWorkLimit(Exception):
@@ -79,7 +81,13 @@ class Operations:
             if scale == 0:
                 return 0.0
             scaled = x.ravel()/scale
-            return scale*math.sqrt(float(np.inner(scaled, scaled)))
+            value = scale*math.sqrt(float(np.inner(scaled, scaled)))
+            # Finite entries need not have a representable Euclidean norm.
+            # In particular, finite_residual / Inf must not certify a local
+            # checkpoint. Reject this numerical failure before forming ratios.
+            if not math.isfinite(value):
+                raise np.linalg.LinAlgError('nonfinite inner residual norm')
+            return value
         # Fixed conservative charge for this norm implementation: scaling,
         # squared-norm reduction, sqrt, and rescaling. Comparisons are not FMA.
         return self.ledger.perform('monitor_norm_model', 2*x.size+2, stable_norm)
@@ -92,8 +100,10 @@ class ApplicationResult:
     solution: object
     work: int
     components: dict
+    # Local checkpoint samples, not the final residual after postsmoothing.
     accepted_ratios: list
     blocked: object = None
+    checkpoint_counts: dict = field(default_factory=dict)
 
 
 def _matvec(A, x):
@@ -103,7 +113,13 @@ def _matvec(A, x):
 
 
 class BudgetedCycle:
-    """A configured, real-FP64 adaptive application; use one active config per hierarchy."""
+    """A real-FP64 adaptive application with at most ``num_cycles`` traversals.
+
+    Local tolerance acceptance skips descent but retains paired postsmoothing.
+    Only a fresh residual of a complete cycle can skip remaining top cycles.
+    One active configuration per hierarchy; observations are local checkpoints,
+    not outer-solver convergence or a proof of nonlinear operator symmetry.
+    """
 
     def __init__(self, ml, cycle, tolerance, num_cycles=1):
         if cycle not in ('K', 'AMLI'):
@@ -165,6 +181,7 @@ class BudgetedCycle:
         ledger = Ledger(limit)
         ops = Operations(ledger)
         accepted = []
+        checkpoints = Counter()
         if workspace is None:
             x = np.zeros_like(b)
         else:
@@ -188,9 +205,15 @@ class BudgetedCycle:
             return ledger.perform('scalar_division', 1, divide)
 
         def accept_fresh(initial, actual):
+            if not math.isfinite(initial) or not math.isfinite(actual):
+                raise np.linalg.LinAlgError('nonfinite inner residual norm')
             relative = actual/initial if initial else (0.0 if actual == 0 else math.inf)
             if math.isfinite(relative) and relative <= self.tolerance:
-                accepted.append(relative)
+                checkpoints['accepted_checkpoints'] += 1
+                if len(accepted) < 64:
+                    accepted.append(relative)
+                else:
+                    checkpoints['accepted_ratio_samples_dropped'] += 1
                 return True
             return False
 
@@ -211,14 +234,19 @@ class BudgetedCycle:
             A = level.A
             if lvl == len(self.ml.levels)-1:
                 y[:] = coarse(A, rhs)
-                return
+                return None
             pre, post = self.smoothers[lvl]
             ledger.perform(pre[1], pre[2], lambda: pre[0](A, y, rhs))
             residual = ops.subtract(rhs, ops.mv(A, y))
             # This residual is already fresh. Do not create a new coarse
             # problem after smoothing has met this level's relative target.
-            if accept_fresh(ops.norm(rhs), ops.norm(residual)):
-                return
+            rhs_norm = ops.norm(rhs)
+            if accept_fresh(rhs_norm, ops.norm(residual)):
+                checkpoints[f'presmoothing_acceptance_level_{lvl}'] += 1
+                # Skip descent, not the adjoint partner of the presmoother.
+                # The post can change the accepted checkpoint's residual.
+                ledger.perform(post[1], post[2], lambda: post[0](A, y, rhs))
+                return rhs_norm
             coarse_b = ops.mv(level.R, residual)
             coarse_x = np.zeros_like(coarse_b)
             Ac = self.ml.levels[lvl+1].A
@@ -229,6 +257,7 @@ class BudgetedCycle:
                 original_rhs = coarse_b.copy()
                 for k in range(self.inner_steps):
                     if done(Ac, coarse_x, original_rhs, coarse_b):
+                        checkpoints[f'inner_step_exit_level_{lvl}'] += 1
                         break
                     # An inner correction is a zero-start solve, not a solve
                     # with the unrelated all-ones initial guess.
@@ -246,6 +275,7 @@ class BudgetedCycle:
                 w = np.zeros_like(r)
                 for k in range(self.inner_steps):
                     if done(Ac, coarse_x, coarse_b, r):
+                        checkpoints[f'inner_step_exit_level_{lvl}'] += 1
                         break
                     w[:] = 0
                     solve(lvl+1, w, r)
@@ -261,18 +291,31 @@ class BudgetedCycle:
                     ops.update(r, Ad, alpha, subtract=True)
             ops.update(y, ops.mv(level.P, coarse_x))
             ledger.perform(post[1], post[2], lambda: post[0](A, y, rhs))
+            return rhs_norm
 
         try:
-            for _ in range(self.num_cycles):
-                solve(0, x, b)
+            for cycle_index in range(self.num_cycles):
+                rhs_norm = solve(0, x, b)
+                checkpoints['cycles_completed'] += 1
+                if cycle_index+1 < self.num_cycles:
+                    # Test the actual postsmoothed iterate only when another
+                    # traversal can be skipped. Reuse this solve's RHS norm.
+                    actual = ops.norm(ops.subtract(b, ops.mv(self.ml.levels[0].A, x)))
+                    if rhs_norm is None:
+                        rhs_norm = ops.norm(b)
+                    if accept_fresh(rhs_norm, actual):
+                        checkpoints['between_cycle_stops'] += 1
+                        break
         except ApplicationWorkLimit as error:
             return ApplicationResult('WORK_LIMIT', None, ledger.spent,
                                      dict(ledger.completed), accepted,
                                      dict(stage=error.stage, required=error.required,
-                                          remaining=error.limit-error.spent))
+                                          remaining=error.limit-error.spent),
+                                     checkpoint_counts=dict(checkpoints))
         if not np.all(np.isfinite(x)):
             raise np.linalg.LinAlgError('nonfinite application output')
-        return ApplicationResult('COMPLETE', x, ledger.spent, dict(ledger.completed), accepted)
+        return ApplicationResult('COMPLETE', x, ledger.spent, dict(ledger.completed), accepted,
+                                 checkpoint_counts=dict(checkpoints))
 
 
 def apply(ml, b, cycle, tolerance, limit=math.inf, num_cycles=1):
